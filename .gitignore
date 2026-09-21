@@ -1,0 +1,43 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- PyInstaller ----------
+build_tmp/
+build/
+dist/
+*.spec
+
+# ---------- Android / Gradle ----------
+.gradle/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+captures/
+.cxx/
+.externalNativeBuild/
+
+# ---------- IDE ----------
+.idea/
+*.iml
+.vscode/
+
+# ---------- 构建产物 / 本地运行输出 ----------
+产出/
+*.exe
+run.log
+股票筛选结果_*.csv
+result.json
+
+# ---------- OS ----------
+Thumbs.db
+Desktop.ini
+.DS_Store

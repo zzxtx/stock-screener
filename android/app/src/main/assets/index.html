@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>股票筛选</title>
+<style>
+  :root { --bg:#f2f4f7; --card:#fff; --line:#e3e7ee; --main:#1f6feb; --txt:#1c2333; --sub:#6b7280; --ok:#16a34a; --warn:#d97706; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); }
+  .wrap { max-width:560px; margin:0 auto; padding:16px 14px 40px; }
+  h1 { font-size:20px; margin:4px 0 2px; }
+  .sub { color:var(--sub); font-size:12px; margin-bottom:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; }
+  .card h2 { font-size:14px; margin:0 0 10px; color:var(--txt); }
+  .conds { margin:0; padding-left:0; list-style:none; }
+  .conds li { font-size:13px; color:#374151; padding:5px 0; border-bottom:1px dashed #eef1f5; display:flex; }
+  .conds li:last-child { border-bottom:none; }
+  .cond-k { color:var(--sub); min-width:82px; flex-shrink:0; }
+  .cond-v { flex:1; }
+  label { display:block; font-size:13px; color:var(--sub); margin-bottom:6px; }
+  input[type=date] { width:100%; font-size:16px; padding:11px 12px; border:1px solid var(--line); border-radius:10px; background:#fafbfc; color:var(--txt); }
+  .btn { display:block; width:100%; margin-top:14px; padding:13px; font-size:16px; font-weight:600; color:#fff; background:var(--main); border:none; border-radius:12px; cursor:pointer; }
+  .btn.secondary { background:#fff; color:var(--main); border:1px solid var(--main); margin-top:10px; }
+  .tip { margin-top:12px; font-size:13px; color:var(--sub); line-height:1.7; min-height:22px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 6px; border-bottom:1px solid #eef1f5; }
+  th { color:var(--sub); font-weight:600; font-size:12px; white-space:nowrap; }
+  td.num { font-variant-numeric:tabular-nums; }
+  tr.hit { background:#f0f9f4; }
+  .empty { color:var(--sub); font-size:13px; text-align:center; padding:16px 0; }
+  .tag { display:inline-block; font-size:11px; padding:2px 6px; border-radius:6px; background:#eef4ff; color:var(--main); }
+  .err { color:#dc2626; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>股票筛选</h1>
+  <div class="sub">数据源：新浪财经 · 后台运行</div>
+
+  <div class="card">
+    <h2>筛选条件</h2>
+    <ul class="conds">
+      <li><span class="cond-k">市场</span><span class="cond-v">沪深主板（沪 600/601/603/605，深 000/001/002）</span></li>
+      <li><span class="cond-k">股价</span><span class="cond-v">3 ~ 30 元（按基准日收盘价）</span></li>
+      <li><span class="cond-k">流通市值</span><span class="cond-v">30 ~ 200 亿（当前值近似）</span></li>
+      <li><span class="cond-k">均线信号</span><span class="cond-v">最近 20 日内 MA5 第二次上穿 MA10，且最新一天刚金叉</span></li>
+      <li><span class="cond-k">MACD</span><span class="cond-v">最新一天 DIF 上穿 DEA 金叉</span></li>
+      <li><span class="cond-k">涨停</span><span class="cond-v">近 20 日内出现过涨停（主板 10% 口径）</span></li>
+      <li><span class="cond-k">其它</span><span class="cond-v">剔除 ST / *ST 等风险警示股</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>选择基准日期</h2>
+    <label>以该日（或之前最近交易日）收盘价与历史行情为基准</label>
+    <input type="date" id="asOf" value="">
+  </div>
+
+  <button class="btn" id="runBtn">开始筛选（后台运行）</button>
+  <div class="tip" id="tip">点击开始后，可退出应用，筛选将在后台继续，完成后通知栏会提醒。</div>
+
+  <div class="card">
+    <h2>筛选结果 <span class="tag" id="hitCount"></span></h2>
+    <div id="resultBody"><div class="empty">暂无结果，点击上方按钮开始筛选。</div></div>
+    <button class="btn secondary" id="refreshBtn">刷新结果</button>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function initDate() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth()+1).padStart(2,'0');
+  const d = String(now.getDate()).padStart(2,'0');
+  $('asOf').value = y + '-' + m + '-' + d;
+}
+
+function renderResult(text) {
+  let root;
+  try { root = JSON.parse(text); } catch(e) { root = {}; }
+  const results = root.results || [];
+  const err = root.error || null;
+  $('hitCount').textContent = results.length + ' 只';
+  const body = $('resultBody');
+  if (err) {
+    body.innerHTML = '<div class="empty err">运行出错：' + err + '</div>';
+    return;
+  }
+  if (!results.length) {
+    body.innerHTML = '<div class="empty">暂无结果，点击上方按钮开始筛选。</div>';
+    return;
+  }
+  let html = '<table><thead><tr><th>代码</th><th>名称</th><th>基准日期</th><th>收盘价</th><th>流通市值(亿)</th></tr></thead><tbody>';
+  for (const r of results) {
+    html += '<tr class="hit"><td class="num">' + r.code + '</td><td>' + r.name + '</td><td class="num">' + r.baseDate + '</td><td class="num">' + r.baseClose.toFixed(2) + '</td><td class="num">' + r.nmcYi.toFixed(2) + '</td></tr>';
+  }
+  html += '</tbody></table>';
+  body.innerHTML = html;
+}
+
+function loadResult() {
+  try {
+    const text = NativeBridge.readResult();
+    if (text && text !== '{}') renderResult(text);
+  } catch(e) {
+    $('tip').innerHTML = '读取结果失败：' + (e && e.message ? e.message : e);
+  }
+}
+
+$('runBtn').addEventListener('click', function() {
+  const asOf = $('asOf').value;
+  if (!asOf) { alert('请选择基准日期'); return; }
+  try {
+    NativeBridge.startScreen(asOf);
+    $('tip').innerHTML = '已在后台开始筛选。你可以退出应用，完成后通知栏会提醒。';
+  } catch(e) {
+    $('tip').innerHTML = '启动失败：' + (e && e.message ? e.message : e);
+  }
+});
+
+$('refreshBtn').addEventListener('click', loadResult);
+
+window.addEventListener('DOMContentLoaded', function() {
+  initDate();
+  loadResult();
+});
+</script>
+</body>
+</html>
