@@ -34,6 +34,9 @@ K_DAYS = 60              # 最低需要的日 K 根数（用于计算均线余�
 K_FETCH_DAYS = 500       # 实际拉取的日 K 根数（支持历史日期回溯）
 SIGNAL_WINDOW = 20       # 信号观察窗口（最近 N 个交易日）
 GOLDEN_CROSS_TARGET = 2  # 窗口内需达到的金叉次数
+MACD_FAST = 6            # MACD 快线 EMA 周期
+MACD_SLOW = 13           # MACD 慢线 EMA 周期
+MACD_SIGNAL = 5          # MACD 信号线 DEA 的 EMA 周期
 SLEEP_SEC = 0.3          # 每次 K 线请求间隔（秒），避免被封
 LIST_PAGE_SIZE = 100     # 列表接口每页数量
 MAX_RETRY = 3            # 单次请求最大重试次数
@@ -198,15 +201,15 @@ def calc_ema(values, period):
 def macd_golden_on_latest(closes):
     """
     判断最新一天是否发生 MACD 金叉（DIF 上穿 DEA）。
-    标准参数：EMA12、EMA26、DEA=EMA9(DIF)。
+    参数：EMA6、EMA13、DEA=EMA5(DIF)。
     """
     n = len(closes)
     if n < 2:
         return False
-    ema12 = calc_ema(closes, 12)
-    ema26 = calc_ema(closes, 26)
-    dif = [a - b for a, b in zip(ema12, ema26)]
-    dea = calc_ema(dif, 9)
+    ema_fast = calc_ema(closes, MACD_FAST)
+    ema_slow = calc_ema(closes, MACD_SLOW)
+    dif = [a - b for a, b in zip(ema_fast, ema_slow)]
+    dea = calc_ema(dif, MACD_SIGNAL)
     i = n - 1
     return dif[i] > dea[i] and dif[i - 1] <= dea[i - 1]
 

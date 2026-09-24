@@ -17,6 +17,11 @@ object StockScreen {
     const val WINDOW = 20
     const val TARGET = 2
 
+    // MACD 参数：DIF = EMA(FAST) - EMA(SLOW)，DEA = EMA(SIGNAL) 对 DIF
+    const val MACD_FAST = 6
+    const val MACD_SLOW = 13
+    const val MACD_SIGNAL = 5
+
     private val SH_MAIN = listOf("600", "601", "603", "605")
     private val SZ_MAIN = listOf("000", "001", "002")
 
@@ -197,11 +202,11 @@ object StockScreen {
     private fun macdGoldenLatest(closes: DoubleArray): Boolean {
         val n = closes.size
         if (n < 2) return false
-        val e12 = calcEMA(closes, 12)
-        val e26 = calcEMA(closes, 26)
+        val eFast = calcEMA(closes, MACD_FAST)
+        val eSlow = calcEMA(closes, MACD_SLOW)
         val dif = DoubleArray(n)
-        for (i in 0 until n) dif[i] = e12[i] - e26[i]
-        val dea = calcEMA(dif, 9)
+        for (i in 0 until n) dif[i] = eFast[i] - eSlow[i]
+        val dea = calcEMA(dif, MACD_SIGNAL)
         val i = n - 1
         return dif[i] > dea[i] && dif[i - 1] <= dea[i - 1]
     }

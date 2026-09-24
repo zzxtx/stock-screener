@@ -17,7 +17,7 @@
 | 2 | 股价 | 3 ~ 30 元（按基准日收盘价判定） |
 | 3 | 流通市值 | 30 亿 ~ 200 亿 |
 | 4 | 均线信号 | 最近 20 个交易日内 MA5 **第二次**上穿 MA10，且最新一天刚好金叉 |
-| 5 | MACD | 最新一天 DIF 上穿 DEA（EMA12 / EMA26，DEA = EMA9） |
+| 5 | MACD | 最新一天 DIF 上穿 DEA（EMA6 / EMA13，DEA = EMA5） |
 | 6 | 涨停 | 最近 20 个交易日内出现过涨停（主板 10% 口径，按涨幅 ≥ 9.8% 判定） |
 | 7 | 排除 | 剔除 ST、\*ST 等风险警示股 |
 
@@ -86,6 +86,8 @@ python screen.py
 
 ### 打包为 exe
 
+双击项目根目录的 **`build_pc.bat`**（推荐），或手动执行：
+
 ```bash
 cd pc
 pip install pyinstaller
@@ -93,6 +95,8 @@ python build_exe.py
 ```
 
 单文件 exe 输出到桌面。
+
+> 注意：exe 文件名由 `pc/build_exe.py` 生成，形如 `股票筛选_20260923_234512.exe`。
 
 ### 可调参数
 
@@ -104,6 +108,7 @@ python build_exe.py
 | `NMC_MIN` / `NMC_MAX` | 300000 / 2000000 | 流通市值区间（万元） |
 | `SIGNAL_WINDOW` | 20 | 信号观察窗口（交易日） |
 | `GOLDEN_CROSS_TARGET` | 2 | 窗口内需达到的金叉次数 |
+| `MACD_FAST` / `MACD_SLOW` / `MACD_SIGNAL` | 6 / 13 / 5 | MACD 快线 / 慢线 / 信号线周期 |
 | `K_DAYS` | 60 | 计算均线所需的最少 K 线根数 |
 | `K_FETCH_DAYS` | 500 | 实际拉取的日 K 根数（支持历史回溯） |
 | `SLEEP_SEC` | 0.3 | 每次 K 线请求的间隔（秒） |
@@ -114,14 +119,22 @@ python build_exe.py
 
 **环境**：JDK 17、Android SDK（platform 34 + build-tools 34.0.0）、Gradle 8.7。
 
-```bash
-# 设置好 JAVA_HOME、ANDROID_HOME 后
-build_android.bat
-```
+双击项目根目录的 **`build_android.bat`** 即可。脚本会自动探测本机 JDK / SDK / Gradle：
+
+| 组件 | 探测顺序 |
+|------|----------|
+| JDK | `JAVA_HOME` → `%LOCALAPPDATA%\jdk-*` → `C:\Program Files\Java\jdk*` → `Eclipse Adoptium` → `D:\Java\jdk*` |
+| SDK | `ANDROID_HOME` → `ANDROID_SDK_ROOT` → `%LOCALAPPDATA%\Android\Sdk` → `D:\Android\Sdk` |
+| Gradle | `GRADLE_HOME` → `%USERPROFILE%\gradle-8.7` → `%USERPROFILE%\gradle-*` → `C:\Gradle\gradle-*` → `PATH` |
+
+若三者都已设置环境变量则优先使用。找不到时脚本会明确报错并暂停（不会一闪而过）。
 
 或用 Android Studio 直接打开 `android/` 目录构建。
 
 > 仓库未包含 Gradle Wrapper，需自备 Gradle 8.7。构建脚本已配置阿里云 Maven 镜像，国内网络可直接拉依赖。
+
+> **维护提示**：两个 `.bat` 均为 **ASCII 纯英文 + CRLF 换行**，请勿用 UTF-8 或 LF 保存。
+> 含中文的 `.bat` 受代码页影响极易乱码，且纯 LF 换行会导致 CMD 解析错乱、双击闪退。
 
 ### 特点
 
@@ -130,7 +143,8 @@ build_android.bat
 - **界面**：原生 WebView 加载本地 HTML，无第三方 UI 框架，APK 体积小；
 - 结果以 JSON 存在应用私有目录，界面点击「刷新结果」即可查看。
 
-筛选参数常量集中在 `android/app/src/main/java/com/example/stockscreen/StockScreen.kt` 顶部。
+筛选参数常量集中在 `android/app/src/main/java/com/example/stockscreen/StockScreen.kt` 顶部
+（`WINDOW` / `TARGET` / `MACD_FAST` / `MACD_SLOW` / `MACD_SIGNAL`）。
 
 ---
 
@@ -155,6 +169,8 @@ build_android.bat
 - **涨停按收盘涨幅近似判定**。使用「收盘价较前一日涨幅 ≥ 9.8%」而非真实涨停价，未考虑新股上市、
   复牌等特殊涨跌幅情形。
 - **MACD 的 EMA 以首根收盘价为种子**，而非标准的 SMA 初始化，与部分行情软件的数值会有微小差异。
+- **MACD 使用 6 / 13 / 5 参数**（快线 EMA6、慢线 EMA13、信号线 DEA=EMA5），非默认的 12 / 26 / 9，
+  信号会比标准参数更灵敏、金叉出现更早。
 - 依赖第三方公开接口，接口变更或限流会导致失败；已内置 3 次重试与请求间隔。
 
 ---
