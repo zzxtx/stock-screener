@@ -188,6 +188,14 @@ Gradle（`GRADLE_HOME` → `%USERPROFILE%\gradle-8.7` → `C:\Gradle\gradle-*` �
 - 界面原生 WebView，结果页除了命中列表，还会画出**条件漏斗**（每条条件剩多少只），
   0 命中时能一眼看出卡在哪一条。
 
+> **包名**：`com.example.gapscreen`（旧版「股票筛选」是 `com.example.stockscreen`）。
+> 两者不同，因此**新旧两个 App 可以同时安装，互不覆盖**。
+> 改包名只需动 `android/app/build.gradle.kts` 里的 `applicationId`，
+> `namespace` 与 Kotlin 包路径保持 `com.example.stockscreen` 不变。
+>
+> 注意：如果之前装过同一个 `com.example.stockscreen` 版本的新包，需要先卸载它，
+> 否则手机上会同时出现两个「缺口放量选股」。
+
 > Android 版参数写在 `StockScreen.kt` 顶部的常量区，与 `screen.py` 一一对应。
 > 手机上暂未提供 `--loose` 开关，需要放宽时改常量重新构建。
 
