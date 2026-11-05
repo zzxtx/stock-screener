@@ -30,13 +30,13 @@ captures/
 *.iml
 .vscode/
 
-# ---------- 构建产物 / 本地运行输出 ----------
-产出/
+# ---------- 构建产物 / 运行输出 ----------
 release/
+output/
 *.exe
 run.log
-股票筛选结果_*.csv
-result.json
+命中_*.csv
+_cyq*
 
 # ---------- OS ----------
 Thumbs.db

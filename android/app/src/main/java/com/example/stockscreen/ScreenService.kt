@@ -1,6 +1,5 @@
 package com.example.stockscreen
 
-import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -45,13 +44,13 @@ class ScreenService : Service() {
             }
 
             override fun onProgress(done: Int, total: Int, hits: Int) {
-                val text = "$done/$total"
                 val pct = if (total == 0) 0 else (done * 100 / total)
-                updateProgress("筛选中… 已命中 $hits 只", text, pct)
+                updateProgress("筛选中… 已命中 $hits 只", "$done/$total", pct)
             }
 
-            override fun onFillResult(results: List<StockScreen.StockResult>, error: String?) {
-                writeResult(results, error)
+            override fun onResult(hits: List<StockScreen.Row>, funnel: IntArray,
+                                  entered: Int, error: String?) {
+                writeResult(asOf, hits, funnel, entered, error)
             }
 
             override fun onFinish() {
@@ -78,19 +77,20 @@ class ScreenService : Service() {
         nm.createNotificationChannel(done)
     }
 
+    private fun pendingIntent(): PendingIntent = PendingIntent.getActivity(
+        this, 0,
+        Intent(this, MainActivity::class.java),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+
     private fun startForegroundCompat() {
-        val pending = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
         val notif = NotificationCompat.Builder(this, CHANNEL_PROGRESS)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("股票筛选中")
+            .setContentTitle("涨停缺口选股")
             .setContentText("正在准备…")
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setContentIntent(pending)
+            .setContentIntent(pendingIntent())
             .build()
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(NOTIF_PROGRESS_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
@@ -101,18 +101,13 @@ class ScreenService : Service() {
 
     private fun updateProgress(state: String, sub: String?, pct: Int) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val pending = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
         val b = NotificationCompat.Builder(this, CHANNEL_PROGRESS)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("股票筛选中")
+            .setContentTitle("涨停缺口选股")
             .setContentText(state)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setContentIntent(pending)
+            .setContentIntent(pendingIntent())
         if (sub != null) {
             b.setContentText(sub).setStyle(NotificationCompat.BigTextStyle().bigText(state))
             b.setProgress(100, pct, false)
@@ -120,22 +115,41 @@ class ScreenService : Service() {
         nm.notify(NOTIF_PROGRESS_ID, b.build())
     }
 
-    private fun writeResult(results: List<StockScreen.StockResult>, error: String?) {
+    private fun rowToJson(r: StockScreen.Row): JSONObject = JSONObject().apply {
+        put("code", r.code)
+        put("name", r.name)
+        put("baseDate", r.baseDate)
+        put("close", r.close)
+        put("chgPct", r.chgPct)
+        put("nmcYi", r.nmcYi)
+        put("limitDate", r.limitDate)
+        put("limitAge", r.limitAge)
+        put("gapDate", r.gapDate)
+        put("gapPct", r.gapPct)
+        put("gapAge", r.gapAge)
+        put("gapRange", r.gapRange)
+        put("scrToday", r.scrToday)
+        put("scrPrev", r.scrPrev)
+        put("scrDelta", r.scrDelta)
+        put("scrP5", r.scrP5)
+        put("scrP95", r.scrP95)
+        put("score", r.score)
+        put("missing", r.missing)
+    }
+
+    private fun writeResult(asOf: String, hits: List<StockScreen.Row>, funnel: IntArray,
+                            entered: Int, error: String?) {
         try {
-            val arr = JSONArray()
-            for (r in results) {
-                val o = JSONObject()
-                o.put("code", r.code)
-                o.put("name", r.name)
-                o.put("baseDate", r.baseDate)
-                o.put("baseClose", r.baseClose)
-                o.put("nmcYi", r.nmcYi)
-                arr.put(o)
-            }
+            val hitArr = JSONArray()
+            for (r in hits) hitArr.put(rowToJson(r))
+            val fn = JSONArray()
+            for (v in funnel) fn.put(v)
             val root = JSONObject()
-            root.put("asOf", today())
+            root.put("asOf", asOf)
             root.put("error", error ?: JSONObject.NULL)
-            root.put("results", arr)
+            root.put("funnel", fn)
+            root.put("entered", entered)
+            root.put("hits", hitArr)
             File(filesDir, RESULT_FILE).writeText(root.toString())
         } catch (e: Exception) {
             // 忽略写入失败
@@ -144,22 +158,16 @@ class ScreenService : Service() {
 
     private fun onScreenFinish() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val result = readResultSummary()
-        val pending = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val summary = readResultSummary()
         val b = NotificationCompat.Builder(this, CHANNEL_DONE)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("筛选完成")
-            .setContentText("点击查看结果（$result）")
-            .setStyle(NotificationCompat.BigTextStyle().bigText("筛选完成：$result"))
+            .setContentText(summary)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(summary))
             .setAutoCancel(true)
-            .setContentIntent(pending)
+            .setContentIntent(pendingIntent())
         nm.notify(NOTIF_DONE_ID, b.build())
 
-        // 收起进度通知
         nm.cancel(NOTIF_PROGRESS_ID)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -171,15 +179,16 @@ class ScreenService : Service() {
             if (!file.exists()) return "无结果"
             val root = JSONObject(file.readText())
             val err = if (root.isNull("error")) null else root.optString("error")
-            if (err != null) "出错：$err"
-            else "命中 ${root.getJSONArray("results").length()} 只"
+            if (err != null) {
+                "出错：$err"
+            } else {
+                "命中 ${root.optJSONArray("hits")?.length() ?: 0} 只"
+            }
         } catch (e: Exception) {
             "无结果"
         }
     }
 
-    private fun today(): String {
-        return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
-            .format(java.util.Date())
-    }
+    private fun today(): String =
+        java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
 }

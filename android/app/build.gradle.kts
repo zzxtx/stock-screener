@@ -4,11 +4,15 @@ plugins {
 }
 
 android {
+    // Kotlin 包名保持 com.example.stockscreen（源码目录结构不变）
     namespace = "com.example.stockscreen"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.stockscreen"
+        // applicationId 是设备上的唯一包名。
+        // 旧版「股票筛选」= com.example.stockscreen，「缺口放量选股」= com.example.gapscreen，
+        // 这里用 limitupgap，三个 App 可以同时装在一台手机上，互不覆盖。
+        applicationId = "com.example.limitupgap"
         minSdk = 21
         targetSdk = 34
         versionCode = 1

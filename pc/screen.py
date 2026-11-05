@@ -1,49 +1,76 @@
 # -*- coding: utf-8 -*-
 """
-沪深主板股票筛选脚本（数据源：新浪财经）
+沪深主板「涨停 + 跳空缺口 + 筹码收敛」选股脚本（数据源：新浪财经公开接口）
 
-筛选条件：
-  1. 沪深主板（沪 600/601/603/605，深 000/001/002）
-  2. 股价 3 元 ~ 30 元
-  3. 流通市值 30 亿 ~ 200 亿
-  4. 最近 20 个交易日内，五日均线(MA5) 第二次 上穿 十日均线(MA10)
-     即：最新一天刚发生金叉，且最近 20 根日 K 内累计恰为第 2 次金叉
-  5. 最新一天 MACD 同时发生金叉（DIF 上穿 DEA）
-  6. 近 20 个交易日内出现过涨停板（主板 10% 口径）
-  7. 剔除 ST、*ST 等风险警示股
+筛选条件（全部满足才算命中）：
+  0. 市场：沪深主板（沪 600/601/603/605，深 000/001/002），剔除 ST / *ST / 退市
+  1. 股价：3 元 < 收盘价 < 25 元
+  2. 涨停：最近一个涨停日 T 至少在 2 个交易日之前，且为「非连板」（T-1 日不是涨停）
+  3. 缺口：涨停次日（T+1）出现向上跳空缺口，且至今未回补
+  4. 筹码：当日筹码集中度小于上一日（筹码在收敛）
+
+筹码集中度采用通达信 CYQ 口径：
+    集中度 = (P95 - P5) / (P95 + P5) × 100
+其中 P5 / P95 是筹码分布累计 5% 和 95% 分位对应的价格。**数值越小表示筹码越集中。**
 
 仅使用 Python 标准库，无第三方依赖。
-运行：python screen.py
+运行：python screen.py [基准日期 YYYY-MM-DD]
+
+本脚本只做数据筛选，不构成任何投资建议。
 """
 
+import argparse
+import concurrent.futures
 import csv
 import datetime
 import json
 import os
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 
-# ================= 可配置参数 =================
-PRICE_MIN = 3.0          # 最低股价（元）
-PRICE_MAX = 30.0         # 最高股价（元）
-NMC_MIN = 300000.0       # 最小流通市值（万元，30亿 = 300000万）
-NMC_MAX = 2000000.0      # 最大流通市值（万元，200亿 = 2000000万）
-K_DAYS = 60              # 最低需要的日 K 根数（用于计算均线余量）
-K_FETCH_DAYS = 500       # 实际拉取的日 K 根数（支持历史日期回溯）
-SIGNAL_WINDOW = 20       # 信号观察窗口（最近 N 个交易日）
-GOLDEN_CROSS_TARGET = 2  # 窗口内需达到的金叉次数
-MACD_FAST = 6            # MACD 快线 EMA 周期
-MACD_SLOW = 13           # MACD 慢线 EMA 周期
-MACD_SIGNAL = 5          # MACD 信号线 DEA 的 EMA 周期
-SLEEP_SEC = 0.3          # 每次 K 线请求间隔（秒），避免被封
-LIST_PAGE_SIZE = 100     # 列表接口每页数量
-MAX_RETRY = 3            # 单次请求最大重试次数
+# ================== 可配置参数 ==================
 
-# 沪深主板代码前缀
+# --- 市场范围 ---
 SH_MAIN = ("600", "601", "603", "605")
 SZ_MAIN = ("000", "001", "002")
+EXCLUDE_NAME_KEYWORDS = ("ST", "退")
+
+# --- 条件 1：股价 ---
+PRICE_MIN = 3.0           # 不含
+PRICE_MAX = 25.0          # 不含
+
+# --- 条件 2：涨停 ---
+LIMIT_UP_PCT = 0.098      # 主板 10% 口径，按涨幅 >= 9.8% 近似
+LIMIT_UP_MIN_AGE = 2      # 涨停日距最新交易日至少 N 天（「后两日」）
+LIMIT_UP_WINDOW = 20      # 只在最近 N 个交易日内找涨停
+NO_CONSECUTIVE = True     # 非连板：涨停前一日不能再是涨停
+
+# --- 条件 3：缺口 ---
+GAP_OFFSET_MIN = 1        # 缺口最早出现在涨停后第 1 天
+GAP_OFFSET_MAX = 1        # 缺口最晚出现在涨停后第 1 天（1/1 = 仅认「次日跳空」）
+GAP_MIN_PCT = 0.2         # 缺口幅度下限 %
+GAP_ALLOW_PARTIAL = False # False=完全未回补；True=允许部分回补
+
+# --- 条件 4：筹码集中度（CYQ） ---
+CYQ_WINDOW = 90           # 筹码迭代窗口（交易日）
+CYQ_BINS = 120            # 价格网格档数
+CYQ_DECAY = 1.0           # 历史筹码衰减强度（1.0 = 按换手率全额衰减）
+SCR_SHRINK = True         # True=要求今日集中度 < 昨日（收敛）
+
+# --- 其它 ---
+MIN_BARS = 120            # 最少需要的 K 线根数
+K_FETCH_DAYS = 320
+SLEEP_SEC = 0.12
+DEFAULT_WORKERS = 6
+MAX_RETRY = 3
+LIST_PAGE_SIZE = 100
+DROP_TODAY_BEFORE = "15:05"
+EPS = 1e-9
+
+# ================== 接口地址 ==================
 
 LIST_URL = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
             "json_v2.php/Market_Center.getHQNodeData")
@@ -52,23 +79,24 @@ COUNT_URL = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
 KLINE_URL = ("https://quotes.sina.cn/cn/api/json_v2.php/"
              "CN_MarketData.getKLineData")
 
-HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/120.0.0.0 Safari/537.36"),
-    "Referer": "https://finance.sina.com.cn",
-}
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+HEADERS = {"User-Agent": UA, "Referer": "https://finance.sina.com.cn"}
+KLINE_HEADERS = {"User-Agent": UA}
 
-# K 线接口备用域名不需要 Referer，仅带 User-Agent 即可
-KLINE_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/120.0.0.0 Safari/537.36"),
-}
+# 四条信号条件（顺序即漏斗顺序）
+CONDITIONS = [
+    ("股价", "3 元 < 股价 < 25 元"),
+    ("涨停", "2 日前涨停且非连板"),
+    ("缺口", "涨停次日跳空且未回补"),
+    ("筹码", "筹码集中度小于上一日"),
+]
+COND_NAMES = [c[0] for c in CONDITIONS]
 
+
+# ================== 网络层 ==================
 
 def http_get_json(url, headers=None, retries=MAX_RETRY):
-    """GET 请求并解析 JSON，失败自动重试。"""
     headers = headers or HEADERS
     last_err = None
     for _ in range(retries):
@@ -76,320 +104,558 @@ def http_get_json(url, headers=None, retries=MAX_RETRY):
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:
                 raw = resp.read()
-            text = raw.decode("utf-8", errors="replace").strip()
-            # 新浪接口有时带 BOM 或 JS 变量包裹，此处一律按 JSON 处理
-            return json.loads(text)
-        except Exception as e:  # noqa: BLE001
+            return json.loads(raw.decode("utf-8", errors="replace").strip())
+        except Exception as e:          # noqa: BLE001
             last_err = e
-            time.sleep(1.0)
-    raise RuntimeError(f"请求失败 {url}: {last_err}")
+            time.sleep(0.8)
+    raise RuntimeError("请求失败 %s: %s" % (url, last_err))
 
 
 def get_total_count():
-    """获取沪深 A 股总数量，接口可能返回字符串或整数。"""
     params = urllib.parse.urlencode({"node": "hs_a"})
-    raw = http_get_json(f"{COUNT_URL}?{params}")
-    # 正常返回为字符串形式的数字，例如 "5549"
+    try:
+        raw = http_get_json("%s?%s" % (COUNT_URL, params))
+    except Exception:                   # noqa: BLE001
+        return 6000
     if isinstance(raw, str):
         try:
             return int(raw)
         except ValueError:
-            return None
-    # 异常时返回 {"__ERROR": 1, ...} 结构
-    if isinstance(raw, dict):
-        return None
-    try:
+            return 6000
+    if isinstance(raw, (int, float)):
         return int(raw)
-    except (TypeError, ValueError):
-        return None
+    return 6000
 
 
-def fetch_stock_list():
-    """分页拉取全市场沪深 A 股列表。"""
+def fetch_stock_list(verbose=True):
+    """分页拉取沪深 A 股全市场快照（nmc 单位为万元）。"""
     total = get_total_count()
-    if total is None:
-        total = 6000  # 无法获取总数时给一个足够大的兜底
-    print(f"沪深 A 股总数约: {total}")
-
-    stocks = []
-    page = 1
+    if verbose:
+        print("沪深 A 股总数约：%d 只" % total)
+    stocks, page = [], 1
     while len(stocks) < total:
         params = urllib.parse.urlencode({
-            "page": page,
-            "num": LIST_PAGE_SIZE,
-            "sort": "symbol",
-            "asc": 1,
-            "node": "hs_a",
+            "page": page, "num": LIST_PAGE_SIZE, "sort": "symbol",
+            "asc": 1, "node": "hs_a",
         })
-        url = f"{LIST_URL}?{params}"
-        data = http_get_json(url)
+        try:
+            data = http_get_json("%s?%s" % (LIST_URL, params))
+        except Exception as e:          # noqa: BLE001
+            if verbose:
+                print("列表第 %d 页失败：%s" % (page, e))
+            break
         if not data:
             break
         stocks.extend(data)
         if len(data) < LIST_PAGE_SIZE:
             break
         page += 1
-        time.sleep(0.2)
-    print(f"实际拉取到 {len(stocks)} 只")
+        time.sleep(0.15)
+    if verbose:
+        print("实际拉取到 %d 只" % len(stocks))
     return stocks
 
 
-def is_main_board(code):
-    """判断是否为沪深主板股票。"""
-    if len(code) != 6 or not code.isdigit():
-        return False
-    return code.startswith(SH_MAIN) or code.startswith(SZ_MAIN)
-
-
-def to_sina_symbol(code):
-    """600xxx -> sh600xxx, 000xxx -> sz000xxx。"""
-    if code.startswith(("6", "5")):
-        return "sh" + code
-    if code.startswith(("0", "1", "2", "3")):
-        return "sz" + code
-    return "sh" + code
-
-
 def fetch_kline(symbol):
-    """
-    拉取某只股票的日 K 线，返回按时间升序的列表，
-    每个元素为 {"day": "YYYY-MM-DD", "close": float}。
-    """
+    """日 K（升序），volume 单位为股。"""
     params = urllib.parse.urlencode({
-        "symbol": symbol,
-        "scale": 240,   # 日线
-        "ma": "no",
-        "datalen": K_FETCH_DAYS,
+        "symbol": symbol, "scale": 240, "ma": "no", "datalen": K_FETCH_DAYS,
     })
-    url = f"{KLINE_URL}?{params}"
-    data = http_get_json(url, headers=KLINE_HEADERS)
+    data = http_get_json("%s?%s" % (KLINE_URL, params), headers=KLINE_HEADERS)
     if not isinstance(data, list) or not data:
         return []
     bars = []
     for bar in data:
         try:
-            day = str(bar.get("day", "")).strip()
-            close = float(bar.get("close", 0))
-            if day:
-                bars.append({"day": day, "close": close})
+            day = str(bar.get("day", "")).strip().split(" ")[0]
+            o = float(bar.get("open", 0))
+            h = float(bar.get("high", 0))
+            l = float(bar.get("low", 0))
+            c = float(bar.get("close", 0))
+            v = float(bar.get("volume", 0))
         except (TypeError, ValueError):
             continue
+        if not day or c <= 0:
+            continue
+        bars.append({"day": day, "open": o, "high": h, "low": l,
+                     "close": c, "volume": v})
+    bars.sort(key=lambda b: b["day"])
     return bars
 
 
-def calc_ma(values, period):
-    """计算移动平均线（与收盘价列表等长，前 period-1 个为 None）。"""
-    ma = [None] * len(values)
-    for i in range(period - 1, len(values)):
-        window = values[i - period + 1: i + 1]
-        ma[i] = sum(window) / period
-    return ma
+# ================== 工具函数 ==================
 
-
-def calc_ema(values, period):
-    """计算指数移动平均线（以首个价格为种子）。"""
-    ema = [None] * len(values)
-    if not values:
-        return ema
-    k = 2.0 / (period + 1)
-    ema[0] = values[0]
-    for i in range(1, len(values)):
-        ema[i] = values[i] * k + ema[i - 1] * (1 - k)
-    return ema
-
-
-def macd_golden_on_latest(closes):
-    """
-    判断最新一天是否发生 MACD 金叉（DIF 上穿 DEA）。
-    参数：EMA6、EMA13、DEA=EMA5(DIF)。
-    """
-    n = len(closes)
-    if n < 2:
+def is_main_board(code):
+    if len(code) != 6 or not code.isdigit():
         return False
-    ema_fast = calc_ema(closes, MACD_FAST)
-    ema_slow = calc_ema(closes, MACD_SLOW)
-    dif = [a - b for a, b in zip(ema_fast, ema_slow)]
-    dea = calc_ema(dif, MACD_SIGNAL)
-    i = n - 1
-    return dif[i] > dea[i] and dif[i - 1] <= dea[i - 1]
+    return code.startswith(SH_MAIN) or code.startswith(SZ_MAIN)
 
 
-def count_golden_cross_in_window(ma5, ma10, window):
+def is_excluded_name(name):
+    up = (name or "").upper().replace(" ", "")
+    return any(k in up for k in EXCLUDE_NAME_KEYWORDS)
+
+
+def to_sina_symbol(code):
+    return ("sh" + code) if code[0] in ("5", "6") else ("sz" + code)
+
+
+def drop_incomplete_today(bars, as_of):
+    """收盘前运行时不把当日未完成的 K 线计入。"""
+    if not bars:
+        return bars
+    now = datetime.datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if bars[-1]["day"] != today or as_of < today:
+        return bars
+    if now.strftime("%H:%M") < DROP_TODAY_BEFORE:
+        return bars[:-1]
+    return bars
+
+
+# ================== 条件 2：涨停 ==================
+
+def is_limit_up(bars, i):
+    """第 i 根是否涨停（主板 10% 口径）。"""
+    if i < 1:
+        return False
+    prev = bars[i - 1]["close"]
+    if prev <= 0:
+        return False
+    return (bars[i]["close"] - prev) / prev >= LIMIT_UP_PCT
+
+
+def find_limit_up(bars):
     """
-    在最近 window 根 K 线内统计金叉次数。
-    金叉定义：当日 MA5 > MA10 且前一日 MA5 <= MA10。
-    返回 (金叉次数, 最新一天是否为金叉)。
+    找最近的涨停日，返回下标；要求满足：
+      · 距最新交易日 >= LIMIT_UP_MIN_AGE（「后两日」）
+      · 在最近 LIMIT_UP_WINDOW 个交易日内
+      · 非连板（涨停前一日不是涨停）
     """
-    n = len(ma5)
-    if n < window + 1:
-        return 0, False
-
-    start = n - window  # 观察窗口的起点下标（含）
-    golden_indices = []
-    for i in range(max(1, start), n):
-        if ma5[i] is None or ma10[i] is None:
+    n = len(bars)
+    latest_ok = n - 1 - LIMIT_UP_MIN_AGE
+    earliest = max(1, n - 1 - LIMIT_UP_WINDOW)
+    if latest_ok < earliest:
+        return None
+    for i in range(latest_ok, earliest - 1, -1):
+        if not is_limit_up(bars, i):
             continue
-        if ma5[i - 1] is None or ma10[i - 1] is None:
+        if NO_CONSECUTIVE and is_limit_up(bars, i - 1):
+            return None          # 最近这次涨停是连板，不符合「非连板」
+        return i
+    return None
+
+
+# ================== 条件 3：缺口 ==================
+
+def find_gap_after_limit_up(bars, t):
+    """
+    只在涨停次日（T+1）找向上跳空缺口，且要求至今未回补。
+    向上跳空缺口：当日最低价 > 前一日最高价，缺口区间 = [前一日最高, 当日最低]。
+    返回最近的一个符合条件缺口；没有则返回 None。
+    """
+    n = len(bars)
+    lo = t + GAP_OFFSET_MIN
+    hi = min(t + GAP_OFFSET_MAX, n - 1)
+    for i in range(hi, lo - 1, -1):
+        if i < 1:
             continue
-        if ma5[i] > ma10[i] and ma5[i - 1] <= ma10[i - 1]:
-            golden_indices.append(i)
-
-    latest_golden = bool(golden_indices) and golden_indices[-1] == n - 1
-    return len(golden_indices), latest_golden
-
-
-def check_signal(closes):
-    """
-    返回是否满足信号条件：
-    最新一天 MA5 上穿 MA10，且最近 SIGNAL_WINDOW 天内恰为第 2 次金叉。
-    """
-    if len(closes) < K_DAYS:
-        return False
-    ma5 = calc_ma(closes, 5)
-    ma10 = calc_ma(closes, 10)
-    count, latest_golden = count_golden_cross_in_window(ma5, ma10, SIGNAL_WINDOW)
-    # 定义 A：最新一天 MA5 上穿 MA10，且最近 20 日内恰为第 2 次金叉
-    if not (latest_golden and count == GOLDEN_CROSS_TARGET):
-        return False
-    # 新增：最新一天 MACD 同时发生金叉（DIF 上穿 DEA）
-    return macd_golden_on_latest(closes)
-
-
-def has_limit_up_in_window(closes, window):
-    """
-    判断最近 window 个交易日内是否出现过涨停板。
-    主板涨停幅度 10%，按涨幅 >= 9.8% 判定（规避涨停价四舍五入误差）。
-    """
-    n = len(closes)
-    if n < 2:
-        return False
-    start = max(1, n - window)
-    for i in range(start, n):
-        prev = closes[i - 1]
-        if prev <= 0:
+        prev_high = bars[i - 1]["high"]
+        low = bars[i]["low"]
+        if prev_high <= 0 or low <= prev_high:
             continue
-        if (closes[i] - prev) / prev >= 0.098:
-            return True
-    return False
+        gap_pct = (low - prev_high) / prev_high * 100.0
+        if gap_pct < GAP_MIN_PCT:
+            continue
+        after = bars[i + 1:]
+        if not after:
+            continue
+        lowest_after = min(b["low"] for b in after)
+        limit = prev_high if GAP_ALLOW_PARTIAL else low
+        if lowest_after <= limit:
+            continue
+        return {
+            "gap_index": i,
+            "gap_date": bars[i]["day"],
+            "gap_pct": round(gap_pct, 2),
+            "gap_age": n - 1 - i,
+            "gap_range": "%.2f ~ %.2f" % (prev_high, low),
+        }
+    return None
 
 
-def get_output_path(as_of=None):
-    """结果文件以时间命名，优先保存到桌面，确保在别的电脑上也能用。"""
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    base = desktop if os.path.isdir(desktop) else os.getcwd()
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    if as_of:
-        label = f"股票筛选结果_{as_of.replace('-', '')}_{ts}"
-    else:
-        label = f"股票筛选结果_{ts}"
-    return os.path.join(base, label + ".csv")
+# ================== 条件 4：筹码集中度（CYQ） ==================
+
+def _triangle_weights(bins, step, pmin, lo, hi, peak):
+    """
+    把一段筹码按三角形分布铺在 [lo, hi] 上，峰在 peak。
+    返回 [(档位下标, 权重)]，权重之和为 1。
+    """
+    if hi <= lo:
+        idx = min(max(int((lo - pmin) / step), 0), bins - 1)
+        return [(idx, 1.0)]
+    i0 = min(max(int((lo - pmin) / step), 0), bins - 1)
+    i1 = min(max(int((hi - pmin) / step), 0), bins - 1)
+    if i1 <= i0:
+        return [(i0, 1.0)]
+    peak = min(max(peak, lo), hi)
+    left = max(peak - lo, 1e-9)
+    right = max(hi - peak, 1e-9)
+    out = []
+    total = 0.0
+    for j in range(i0, i1 + 1):
+        price = pmin + (j + 0.5) * step
+        if price <= peak:
+            w = (price - lo) / left
+        else:
+            w = (hi - price) / right
+        w = max(w, 0.0)
+        if w > 0:
+            out.append((j, w))
+            total += w
+    if total <= 0:
+        return [(i0, 1.0)]
+    return [(j, w / total) for j, w in out]
 
 
-def prompt_date():
-    """提示用户输入筛选基准日期，格式 YYYY-MM-DD。"""
-    while True:
-        raw = input("请输入筛选基准日期（格式 YYYY-MM-DD，例如 2026-08-28）：").strip()
+def _scr(chips, pmin, step):
+    """
+    集中度 = (P95 - P5) / (P95 + P5) × 100
+    返回 (集中度, P5, P95)，数值越小越集中。
+
+    分位数在档内线性插值，否则价格网格较粗时（例如 0.15 元一档）
+    连续几天的 P5/P95 会被钉死在同一档，导致集中度完全不变。
+    """
+    total = sum(chips)
+    if total <= 0:
+        return None
+    t5 = total * 0.05
+    t95 = total * 0.95
+    acc = 0.0
+    p5 = p95 = None
+    for j, c in enumerate(chips):
+        if c <= 0:
+            continue
+        lo = pmin + j * step
+        nxt = acc + c
+        if p5 is None and nxt >= t5:
+            p5 = lo + (t5 - acc) / c * step
+        if nxt >= t95:
+            p95 = lo + (t95 - acc) / c * step
+            break
+        acc = nxt
+    if p5 is None or p95 is None:
+        return None
+    if p5 + p95 <= 0:
+        return None
+    return (p95 - p5) / (p95 + p5) * 100.0, p5, p95
+
+
+def chip_concentration(bars, float_shares, window=CYQ_WINDOW, bins=CYQ_BINS):
+    """
+    计算最后两个交易日的筹码集中度，返回 (今日, 昨日, 今日P5, 今日P95)。
+    某日无法计算时对应位置为 None。
+
+    模型：三角形分布 + 换手衰减
+      · 每日旧筹码按 (1 - 换手率 × CYQ_DECAY) 衰减
+      · 当日换手部分按三角形分布铺在 [low, high] 上，峰在均价
+    """
+    n = len(bars)
+    if float_shares <= 0 or n < 2:
+        return None, None, None, None
+    start = max(0, n - window)
+    seg = bars[start:]
+    pmin = min(b["low"] for b in seg)
+    pmax = max(b["high"] for b in seg)
+    if pmax <= pmin:
+        return None, None, None, None
+    step = (pmax - pmin) / bins
+
+    chips = [0.0] * bins
+    prev = None
+    cur = None
+    prev_p5 = prev_p95 = None
+    cur_p5 = cur_p95 = None
+    for idx in range(start, n):
+        b = bars[idx]
+        tr = b["volume"] / float_shares
+        tr = min(max(tr, 0.0), 0.95)
+        if not any(chips):
+            chips = [0.0] * bins
+        else:
+            keep = max(0.0, 1.0 - tr * CYQ_DECAY)
+            if keep < 1.0:
+                chips = [c * keep for c in chips]
+        if tr > 0:
+            lo, hi = b["low"], b["high"]
+            peak = (b["high"] + b["low"] + b["close"]) / 3.0
+            add = tr
+            for j, w in _triangle_weights(bins, step, pmin, lo, hi, peak):
+                chips[j] += add * w
+        res = _scr(chips, pmin, step)
+        prev, prev_p5, prev_p95 = cur, cur_p5, cur_p95
+        if res:
+            cur, cur_p5, cur_p95 = res
+        else:
+            cur = cur_p5 = cur_p95 = None
+    return cur, prev, cur_p5, cur_p95
+
+
+# ================== 主流程 ==================
+
+def build_candidates(stocks):
+    """主板 + 非 ST。股价与其余条件都在拿到 K 线后再判。"""
+    cands = []
+    for s in stocks:
+        code = str(s.get("code", "")).strip()
+        if not is_main_board(code):
+            continue
+        name = str(s.get("name", "")).strip()
+        if is_excluded_name(name):
+            continue
         try:
-            d = datetime.datetime.strptime(raw, "%Y-%m-%d")
-            return d.strftime("%Y-%m-%d")
+            nmc = float(s.get("nmc", 0) or 0)      # 万元
+        except (TypeError, ValueError):
+            continue
+        cands.append({
+            "code": code,
+            "name": name,
+            "symbol": to_sina_symbol(code),
+            "nmc_yi": round(nmc / 10000.0, 2) if nmc else 0.0,
+            "nmc_yuan": nmc * 10000.0,
+        })
+    return cands
+
+
+def evaluate(c, as_of, stats, lock):
+    """逐条判定四个条件，返回结果 dict 或 None（数据不足）。"""
+    def bump(key):
+        with lock:
+            stats[key] = stats.get(key, 0) + 1
+
+    try:
+        bars = fetch_kline(c["symbol"])
+    except Exception:                    # noqa: BLE001
+        bump("K线失败")
+        return None
+    if not bars:
+        bump("无K线")
+        return None
+
+    last_close_raw = bars[-1]["close"]
+    float_shares = c["nmc_yuan"] / last_close_raw if last_close_raw > 0 else 0.0
+
+    bars = [b for b in bars if b["day"] <= as_of]
+    bars = drop_incomplete_today(bars, as_of)
+    if len(bars) < MIN_BARS:
+        bump("K线不足")
+        return None
+
+    n = len(bars)
+    close = bars[-1]["close"]
+    if bars[-1]["volume"] <= 0 or close <= 0:
+        bump("停牌")
+        return None
+
+    # ---- 条件 1：股价 ----
+    ok_price = (PRICE_MIN + EPS) < close < (PRICE_MAX - EPS)
+
+    # ---- 条件 2：涨停 ----
+    t = find_limit_up(bars)
+    ok_limit = t is not None
+
+    # ---- 条件 3：缺口 ----
+    gap = find_gap_after_limit_up(bars, t) if ok_limit else None
+    ok_gap = gap is not None
+
+    # ---- 条件 4：筹码集中度 ----
+    scr_today, scr_prev, p5, p95 = chip_concentration(bars, float_shares)
+    ok_chip = False
+    if scr_today is not None and scr_prev is not None:
+        ok_chip = (scr_today < scr_prev) if SCR_SHRINK else (scr_today > scr_prev)
+
+    flags = {
+        "股价": ok_price,
+        "涨停": ok_limit,
+        "缺口": ok_gap,
+        "筹码": ok_chip,
+    }
+    score = sum(1 for v in flags.values() if v)
+    missing = [k for k in COND_NAMES if not flags[k]]
+    if score == len(COND_NAMES):
+        bump("命中")
+
+    chg = (close - bars[-2]["close"]) / bars[-2]["close"] * 100.0 if bars[-2]["close"] > 0 else 0.0
+    return {
+        "code": c["code"],
+        "name": c["name"],
+        "base_date": bars[-1]["day"],
+        "close": round(close, 2),
+        "chg_pct": round(chg, 2),
+        "nmc_yi": c["nmc_yi"],
+        "limit_date": bars[t]["day"] if t is not None else "",
+        "limit_age": (n - 1 - t) if t is not None else "",
+        "gap_date": gap["gap_date"] if gap else "",
+        "gap_pct": gap["gap_pct"] if gap else "",
+        "gap_age": gap["gap_age"] if gap else "",
+        "gap_range": gap["gap_range"] if gap else "",
+        "scr_today": round(scr_today, 2) if scr_today is not None else "",
+        "scr_prev": round(scr_prev, 2) if scr_prev is not None else "",
+        "scr_delta": round(scr_today - scr_prev, 2)
+                     if (scr_today is not None and scr_prev is not None) else "",
+        "scr_p5": round(p5, 2) if p5 else "",
+        "scr_p95": round(p95, 2) if p95 else "",
+        "score": score,
+        "missing": "/".join(missing),
+        "flags": flags,
+    }
+
+
+CSV_FIELDS = [
+    ("code", "代码"), ("name", "名称"), ("base_date", "基准日期"),
+    ("close", "收盘价"), ("chg_pct", "当日涨幅%"), ("nmc_yi", "流通市值(亿)"),
+    ("limit_date", "涨停日"), ("limit_age", "涨停距今(日)"),
+    ("gap_date", "缺口日"), ("gap_pct", "缺口幅度%"), ("gap_age", "缺口距今(日)"),
+    ("gap_range", "缺口区间"),
+    ("scr_today", "今日集中度"), ("scr_prev", "昨日集中度"),
+    ("scr_delta", "集中度变化"), ("scr_p5", "成本P5"), ("scr_p95", "成本P95"),
+]
+
+SKIP_KEYS = ("K线失败", "无K线", "K线不足", "停牌", "计算异常")
+
+
+def print_funnel(rows, total):
+    entered = len(rows)
+    print("\n" + "-" * 60)
+    print("筛选漏斗（候选 %d 只，可计算 %d 只）" % (total, entered))
+    print("-" * 60)
+    if not entered:
+        print("  无可计算样本")
+        return
+    alive = rows
+    for name, desc in CONDITIONS:
+        alive = [r for r in alive if r["flags"][name]]
+        pct = len(alive) / entered * 100
+        filled = int(round(pct / 4.0))
+        bar = "#" * filled + "." * (25 - filled)
+        print("  [%s] %-24s %4d 只 %5.1f%%  %s"
+              % ("OK" if alive else "--", desc, len(alive), pct, bar))
+    print("-" * 60)
+    print("  四条全部满足：%d 只" % len(alive))
+
+
+def write_csv(rows, path, fields):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow([label for _, label in fields])
+        for r in rows:
+            w.writerow([r.get(k, "") for k, _ in fields])
+
+
+def default_out_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(here), "output")
+
+
+def ask_date():
+    while True:
+        raw = input("请输入筛选基准日期（YYYY-MM-DD，直接回车=最近交易日）：").strip()
+        if not raw:
+            return datetime.datetime.now().strftime("%Y-%m-%d")
+        try:
+            return datetime.datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            print("日期格式错误，请按 YYYY-MM-DD 格式重新输入。")
-
-
-def slice_kline_by_date(bars, as_of):
-    """截取 day <= as_of 的 K 线（按时间升序）。"""
-    return [b for b in bars if b["day"] <= as_of]
+            print("日期格式错误，请按 YYYY-MM-DD 重新输入。")
 
 
 def main():
-    as_of = prompt_date()
-    print(f"基准日期：{as_of}（取该日或之前最近交易日）")
-    output = get_output_path(as_of)
+    ap = argparse.ArgumentParser(description="涨停 + 跳空缺口 + 筹码收敛 选股")
+    ap.add_argument("date", nargs="?", help="基准日期 YYYY-MM-DD，缺省为最近交易日")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    ap.add_argument("--limit", type=int, default=0, help="仅测试前 N 只")
+    ap.add_argument("--out-dir", default="")
+    args = ap.parse_args()
+
+    as_of = args.date or ask_date()
+    try:
+        datetime.datetime.strptime(as_of, "%Y-%m-%d")
+    except ValueError:
+        print("日期格式错误：%s" % as_of)
+        return 1
+
+    out_dir = args.out_dir or default_out_dir()
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = "%s_%s" % (as_of.replace("-", ""), ts)
+
+    print("基准日期：%s（取该日或之前最近一个交易日）" % as_of)
     stocks = fetch_stock_list()
+    cands = build_candidates(stocks)
+    print("主板 + 非 ST 初筛后：%d 只" % len(cands))
+    if args.limit:
+        cands = cands[:args.limit]
+        print("（测试模式，仅计算前 %d 只）" % len(cands))
+    if not cands:
+        print("没有候选股票，退出。")
+        return 0
 
-    candidates = []
-    for s in stocks:
-        code = str(s.get("code", ""))
-        if not is_main_board(code):
-            continue
-        name = s.get("name", "")
-        # 剔除 ST、*ST 等风险警示股
-        if "ST" in name.upper():
-            continue
+    total = len(cands)
+    stats, lock = {}, threading.Lock()
+    done = [0]
+    rows = []
+    t0 = time.time()
+
+    def work(c):
         try:
-            nmc = float(s.get("nmc", 0) or 0)  # 单位：万元
-        except (TypeError, ValueError):
-            continue
-
-        # 初筛：仅按流通市值过滤（股价留到拉取 K 线后按基准日收盘价判定）
-        if nmc <= 0 or not (NMC_MIN <= nmc <= NMC_MAX):
-            continue
-
-        candidates.append({
-            "code": code,
-            "symbol": to_sina_symbol(code),
-            "name": name,
-            "nmc_yi": round(nmc / 10000, 2),  # 转为亿元
-        })
-
-    print(f"流通市值初筛后剩余: {len(candidates)} 只")
-
-    results = []
-    for idx, c in enumerate(candidates, 1):
-        try:
-            bars = fetch_kline(c["symbol"])
-        except Exception as e:  # noqa: BLE001
-            print(f"[{idx}/{len(candidates)}] {c['code']} {c['name']} K线获取失败: {e}")
-            continue
-
-        bars = slice_kline_by_date(bars, as_of)
-        if len(bars) < K_DAYS:
-            continue
-
-        closes = [b["close"] for b in bars]
-        base_close = closes[-1]   # 基准日收盘价（截止日或之前最近交易日）
-        base_date = bars[-1]["day"]
-
-        # 股价最终以基准日收盘价判断
-        if not (PRICE_MIN <= base_close <= PRICE_MAX):
-            continue
-
-        try:
-            ok_signal = check_signal(closes)
-            ok_limit = has_limit_up_in_window(closes, SIGNAL_WINDOW)
-        except Exception as e:  # noqa: BLE001
-            print(f"[{idx}/{len(candidates)}] {c['code']} 信号计算失败: {e}")
-            continue
-
-        if ok_signal and ok_limit:
-            hit = dict(c)
-            hit["base_close"] = round(base_close, 2)
-            hit["base_date"] = base_date
-            results.append(hit)
-            print(f"[{idx}/{len(candidates)}] 命中: {c['code']} {c['name']} "
-                  f"基准日 {base_date} 收盘 {hit['base_close']} 流通市值 {c['nmc_yi']}亿")
-
-        if idx % 20 == 0:
-            print(f"进度: {idx}/{len(candidates)}")
+            r = evaluate(c, as_of, stats, lock)
+        except Exception as e:           # noqa: BLE001
+            with lock:
+                stats["计算异常"] = stats.get("计算异常", 0) + 1
+            print("  ! %s %s 计算异常: %s" % (c["code"], c["name"], e))
+            r = None
+        with lock:
+            done[0] += 1
+            if done[0] % 200 == 0 or done[0] == total:
+                print("  进度 %d/%d  用时 %.0fs" % (done[0], total, time.time() - t0))
         time.sleep(SLEEP_SEC)
+        return r
 
-    # 输出 CSV
-    with open(output, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(["代码", "名称", "基准日期", "收盘价", "流通市值(亿)"])
-        for r in results:
-            writer.writerow([r["code"], r["name"], r["base_date"], r["base_close"], r["nmc_yi"]])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        for r in pool.map(work, cands):
+            if r:
+                rows.append(r)
 
-    print("\n" + "=" * 40)
-    print(f"筛选完成，共命中 {len(results)} 只，结果见 {output}")
-    if results:
-        for r in results:
-            print(f"{r['code']} {r['name']}  {r['base_date']} 收盘 {r['base_close']}  流通市值 {r['nmc_yi']} 亿")
+    hits = [r for r in rows if r["score"] == len(COND_NAMES)]
+    hits.sort(key=lambda r: (-r["chg_pct"], r["code"]))
+
+    hit_path = os.path.join(out_dir, "命中_%s.csv" % tag)
+    write_csv(hits, hit_path, CSV_FIELDS)
+
+    print_funnel(rows, total)
+    skipped = [(k, stats.get(k, 0)) for k in SKIP_KEYS if stats.get(k)]
+    if skipped:
+        print("  跳过：" + "，".join("%s %d 只" % kv for kv in skipped))
+
+    print("\n" + "=" * 60)
+    if hits:
+        print("命中 %d 只（四条条件全部满足）：" % len(hits))
+        for r in hits:
+            print("  %s %-6s 收 %.2f 涨 %+.2f%% | 涨停 %s(%s日前) | 缺口 %s(+%.2f%%,%s日前) "
+                  "| 集中度 %s → %s"
+                  % (r["code"], r["name"], r["close"], r["chg_pct"],
+                     r["limit_date"], r["limit_age"], r["gap_date"], r["gap_pct"],
+                     r["gap_age"], r["scr_prev"], r["scr_today"]))
+    else:
+        print("命中 0 只 —— 四条条件同时成立的概率较低，属正常结果")
+
+    print("\n用时 %.0fs" % (time.time() - t0))
+    print("结果文件：%s" % hit_path)
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
         print("\n已手动终止")
         sys.exit(1)

@@ -5,117 +5,380 @@ import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.max
+import kotlin.math.min
 
+/**
+ * 沪深主板「涨停 + 次日跳空缺口 + 筹码收敛」筛选逻辑。
+ *
+ * 四条信号条件（同时满足才算命中）：
+ *   1 股价 3 < 收盘 < 25
+ *   2 最近涨停日 T 距最新 >= 2 个交易日，且非连板（T-1 不是涨停）
+ *   3 涨停次日（T+1）出现向上跳空缺口，且至今未回补
+ *   4 当日筹码集中度 < 上一日（筹码收敛）
+ *
+ * 与 PC 版 pc/screen.py 的口径完全一致，包含 CYQ 筹码分布模型。
+ */
 object StockScreen {
 
+    // ===== 可配置参数 =====
     const val PRICE_MIN = 3.0
-    const val PRICE_MAX = 30.0
-    const val NMC_MIN = 300000.0   // 万元
-    const val NMC_MAX = 2000000.0  // 万元
-    const val K_DAYS = 60
-    const val K_FETCH_DAYS = 500
-    const val WINDOW = 20
-    const val TARGET = 2
-
-    // MACD 参数：DIF = EMA(FAST) - EMA(SLOW)，DEA = EMA(SIGNAL) 对 DIF
-    const val MACD_FAST = 6
-    const val MACD_SLOW = 13
-    const val MACD_SIGNAL = 5
+    const val PRICE_MAX = 25.0
+    const val LIMIT_UP_PCT = 0.098
+    const val LIMIT_UP_MIN_AGE = 2
+    const val LIMIT_UP_WINDOW = 20
+    const val NO_CONSECUTIVE = true
+    const val GAP_OFFSET_MIN = 1
+    const val GAP_OFFSET_MAX = 1
+    const val GAP_MIN_PCT = 0.2
+    const val GAP_ALLOW_PARTIAL = false
+    const val CYQ_WINDOW = 90
+    const val CYQ_BINS = 120
+    const val CYQ_DECAY = 1.0
+    const val SCR_SHRINK = true
+    const val MIN_BARS = 120
+    const val K_FETCH_DAYS = 320
+    const val THREADS = 4
+    private const val EPS = 1e-9
 
     private val SH_MAIN = listOf("600", "601", "603", "605")
     private val SZ_MAIN = listOf("000", "001", "002")
+    private val EXCLUDE_NAME = listOf("ST", "退")
+    private val COND_NAMES = listOf("股价", "涨停", "缺口", "筹码")
 
     private const val KLINE_URL = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData"
     private const val LIST_URL = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
     private const val COUNT_URL = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeStockCount"
     private const val REF = "https://finance.sina.com.cn"
 
-    data class Stock(val code: String, val name: String, val symbol: String, val nmcYi: Double)
-    data class StockResult(val code: String, val name: String, val baseDate: String, val baseClose: Double, val nmcYi: Double)
+    data class Stock(val code: String, val name: String, val symbol: String,
+                     val nmcYi: Double, val nmcYuan: Double)
 
-    private data class Bar(val day: String, val close: Double)
+    data class Row(
+        val code: String, val name: String, val baseDate: String,
+        val close: Double, val chgPct: Double, val nmcYi: Double,
+        val limitDate: String, val limitAge: Int,
+        val gapDate: String, val gapPct: Double, val gapAge: Int, val gapRange: String,
+        val scrToday: Double, val scrPrev: Double, val scrDelta: Double,
+        val scrP5: Double, val scrP95: Double,
+        val score: Int, val missing: String
+    )
+
+    private data class Bar(val day: String, val open: Double, val high: Double,
+                           val low: Double, val close: Double, val volume: Double)
+
+    private data class Gap(val index: Int, val date: String, val pct: Double,
+                           val age: Int, val range: String)
 
     interface Listener {
         fun onState(state: String)
         fun onProgress(done: Int, total: Int, hits: Int)
-        fun onFillResult(results: List<StockResult>, error: String?)
+        fun onResult(hits: List<Row>, funnel: IntArray, entered: Int, error: String?)
         fun onFinish()
     }
 
     fun run(asOf: String, listener: Listener) {
         Thread {
-            val results = Collections.synchronizedList(ArrayList<StockResult>())
             try {
                 listener.onState("正在获取沪深 A 股列表…")
                 val stocks = fetchStockList { s -> listener.onState(s) }
-                listener.onState("初筛剩余 ${stocks.size} 只，开始拉取日 K 并计算信号…")
-
-                val total = stocks.size
-                if (total == 0) {
-                    listener.onFillResult(emptyList(), null)
-                } else {
-                    val done = AtomicInteger(0)
-                    val pool = Executors.newFixedThreadPool(4)
-                    try {
-                        val futures = ArrayList<java.util.concurrent.Future<*>>()
-                        for (i in 0 until minOf(4, total)) {
-                            futures.add(pool.submit { worker(stocks, total, done, asOf, listener, results) })
-                        }
-                        for (f in futures) f.get()
-                    } finally {
-                        pool.shutdown()
-                    }
-                    listener.onFillResult(results.sortedBy { it.code }, null)
+                listener.onState("初筛剩余 ${stocks.size} 只，开始拉取日 K 并计算筹码…")
+                if (stocks.isEmpty()) {
+                    listener.onResult(emptyList(), IntArray(COND_NAMES.size), 0, null)
+                    return@Thread
                 }
+                val total = stocks.size
+                val done = AtomicInteger(0)
+                val hitCount = AtomicInteger(0)
+                val rows = Collections.synchronizedList(ArrayList<Row>())
+                val failFirst = FailCounter()
+                val pool = Executors.newFixedThreadPool(THREADS)
+                try {
+                    val futures = ArrayList<java.util.concurrent.Future<*>>()
+                    for (i in 0 until minOf(THREADS, total)) {
+                        futures.add(pool.submit {
+                            while (true) {
+                                val idx = done.getAndIncrement()
+                                if (idx >= total) break
+                                val row = try { evaluate(stocks[idx], asOf) } catch (e: Exception) { null }
+                                if (row != null) {
+                                    rows.add(row)
+                                    failFirst.inc(firstFailIndex(row))
+                                    if (row.score == COND_NAMES.size) hitCount.incrementAndGet()
+                                }
+                                listener.onProgress(minOf(done.get(), total), total, hitCount.get())
+                                Thread.sleep(60)
+                            }
+                        })
+                    }
+                    for (f in futures) f.get()
+                } finally {
+                    pool.shutdown()
+                }
+                val hits = rows.filter { it.score == COND_NAMES.size }
+                    .sortedByDescending { it.chgPct }
+                listener.onResult(hits, failFirst.prefix(), rows.size, null)
             } catch (e: Exception) {
-                listener.onFillResult(emptyList(), e.message ?: "unknown error")
+                listener.onResult(emptyList(), IntArray(COND_NAMES.size), 0,
+                    e.message ?: "unknown error")
             } finally {
                 listener.onFinish()
             }
         }.start()
     }
 
-    private fun worker(
-        candidates: List<Stock>,
-        total: Int,
-        done: AtomicInteger,
-        asOf: String,
-        listener: Listener,
-        results: MutableList<StockResult>
-    ) {
-        while (true) {
-            val idx = done.getAndIncrement()
-            if (idx >= total) break
-            val c = candidates[idx]
-            try {
-                val bars = fetchKline(c.symbol)
-                val sliced = bars.filter { it.day <= asOf }
-                if (sliced.size >= K_DAYS) {
-                    val closes = DoubleArray(sliced.size) { sliced[it].close }
-                    val baseClose = closes[closes.size - 1]
-                    val baseDate = sliced[sliced.size - 1].day
-                    if (baseClose >= PRICE_MIN && baseClose <= PRICE_MAX) {
-                        if (checkSignal(closes) && hasLimitUp(closes, WINDOW)) {
-                            results.add(StockResult(c.code, c.name, baseDate, baseClose, c.nmcYi))
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                // 单只失败跳过
+    /** 统计每行「第几条开始不满足」，用于漏斗。 */
+    private class FailCounter {
+        private val arr = IntArray(COND_NAMES.size + 1)
+        @Synchronized fun inc(i: Int) { arr[i] = arr[i] + 1 }
+        @Synchronized fun prefix(): IntArray {
+            val out = IntArray(COND_NAMES.size)
+            for (i in out.indices) {
+                var c = 0
+                for (j in (i + 1)..COND_NAMES.size) c += arr[j]
+                out[i] = c
             }
-            listener.onProgress(done.get(), total, results.size)
-            Thread.sleep(60)
+            return out
         }
     }
 
-    // ===== 网络拉取 =====
+    private fun firstFailIndex(r: Row): Int {
+        val i = when {
+            !(r.close > PRICE_MIN + EPS && r.close < PRICE_MAX - EPS) -> 0
+            r.limitDate.isEmpty() -> 1
+            r.gapDate.isEmpty() -> 2
+            !(if (SCR_SHRINK) r.scrToday < r.scrPrev else r.scrToday > r.scrPrev) -> 3
+            else -> -1
+        }
+        return if (i < 0) COND_NAMES.size else i
+    }
+
+    // ===== 单只股票判定 =====
+
+    private fun evaluate(c: Stock, asOf: String): Row? {
+        var bars = fetchKline(c.symbol)
+        if (bars.isEmpty()) return null
+
+        val floatShares = if (bars.last().close > 0) c.nmcYuan / bars.last().close else 0.0
+        bars = bars.filter { it.day <= asOf }
+        bars = dropIncompleteToday(bars, asOf)
+        if (bars.size < MIN_BARS) return null
+
+        val n = bars.size
+        val close = bars[n - 1].close
+        if (bars[n - 1].volume <= 0.0 || close <= 0.0) return null
+
+        // 1 股价
+        val okPrice = close > PRICE_MIN + EPS && close < PRICE_MAX - EPS
+
+        // 2 涨停
+        val t = findLimitUp(bars)
+        // 3 缺口（仅次日）
+        val gap = if (t >= 0) findGapAfterLimitUp(bars, t) else null
+
+        // 4 筹码
+        val chip = chipConcentration(bars, floatShares)
+        val scrToday = chip[0]
+        val scrPrev = chip[1]
+        val okChip = if (scrToday.isNaN() || scrPrev.isNaN()) false
+        else if (SCR_SHRINK) scrToday < scrPrev else scrToday > scrPrev
+
+        val flags = booleanArrayOf(okPrice, t >= 0, gap != null, okChip)
+        val score = flags.count { it }
+        val missing = COND_NAMES.filterIndexed { i, _ -> !flags[i] }.joinToString("/")
+
+        val prevClose = bars[n - 2].close
+        val chg = if (prevClose > 0) (close - prevClose) / prevClose * 100.0 else 0.0
+
+        return Row(
+            code = c.code, name = c.name, baseDate = bars[n - 1].day,
+            close = round2(close), chgPct = round2(chg), nmcYi = c.nmcYi,
+            limitDate = if (t >= 0) bars[t].day else "",
+            limitAge = if (t >= 0) n - 1 - t else 0,
+            gapDate = gap?.date ?: "", gapPct = gap?.pct ?: 0.0,
+            gapAge = gap?.age ?: 0, gapRange = gap?.range ?: "",
+            scrToday = if (scrToday.isNaN()) 0.0 else round2(scrToday),
+            scrPrev = if (scrPrev.isNaN()) 0.0 else round2(scrPrev),
+            scrDelta = if (scrToday.isNaN() || scrPrev.isNaN()) 0.0 else round2(scrToday - scrPrev),
+            scrP5 = if (chip[2].isNaN()) 0.0 else round2(chip[2]),
+            scrP95 = if (chip[3].isNaN()) 0.0 else round2(chip[3]),
+            score = score, missing = missing
+        )
+    }
+
+    // ===== 涨停 =====
+
+    private fun isLimitUp(bars: List<Bar>, i: Int): Boolean {
+        if (i < 1) return false
+        val prev = bars[i - 1].close
+        if (prev <= 0) return false
+        return (bars[i].close - prev) / prev >= LIMIT_UP_PCT
+    }
+
+    /** 返回涨停日下标，找不到返回 -1。 */
+    private fun findLimitUp(bars: List<Bar>): Int {
+        val n = bars.size
+        val latestOk = n - 1 - LIMIT_UP_MIN_AGE
+        val earliest = max(1, n - 1 - LIMIT_UP_WINDOW)
+        if (latestOk < earliest) return -1
+        for (i in latestOk downTo earliest) {
+            if (!isLimitUp(bars, i)) continue
+            if (NO_CONSECUTIVE && isLimitUp(bars, i - 1)) return -1
+            return i
+        }
+        return -1
+    }
+
+    // ===== 缺口 =====
+
+    private fun findGapAfterLimitUp(bars: List<Bar>, t: Int): Gap? {
+        val n = bars.size
+        val lo = t + GAP_OFFSET_MIN
+        val hi = min(t + GAP_OFFSET_MAX, n - 1)
+        for (i in hi downTo lo) {
+            if (i < 1) continue
+            val prevHigh = bars[i - 1].high
+            val low = bars[i].low
+            if (prevHigh <= 0 || low <= prevHigh) continue
+            val pct = (low - prevHigh) / prevHigh * 100.0
+            if (pct < GAP_MIN_PCT) continue
+            var lowestAfter = Double.MAX_VALUE
+            for (j in i + 1 until n) if (bars[j].low < lowestAfter) lowestAfter = bars[j].low
+            if (lowestAfter == Double.MAX_VALUE) continue
+            val limit = if (GAP_ALLOW_PARTIAL) prevHigh else low
+            if (lowestAfter <= limit) continue
+            return Gap(i, bars[i].day, round2(pct), n - 1 - i,
+                String.format(java.util.Locale.US, "%.2f ~ %.2f", prevHigh, low))
+        }
+        return null
+    }
+
+    // ===== 筹码集中度（CYQ） =====
+
+    /** 返回 [今日集中度, 昨日集中度, 今日P5, 今日P95]，无法计算时为 NaN。 */
+    private fun chipConcentration(bars: List<Bar>, floatShares: Double): DoubleArray {
+        val nan = doubleArrayOf(Double.NaN, Double.NaN, Double.NaN, Double.NaN)
+        val n = bars.size
+        if (floatShares <= 0 || n < 2) return nan
+        val start = max(0, n - CYQ_WINDOW)
+        var pmin = Double.MAX_VALUE
+        var pmax = -Double.MAX_VALUE
+        for (k in start until n) {
+            if (bars[k].low < pmin) pmin = bars[k].low
+            if (bars[k].high > pmax) pmax = bars[k].high
+        }
+        if (pmax <= pmin) return nan
+        val bins = CYQ_BINS
+        val step = (pmax - pmin) / bins
+        val chips = DoubleArray(bins)
+        var initialized = false
+        var prev = Double.NaN
+        var cur = Double.NaN
+        var curP5 = Double.NaN
+        var curP95 = Double.NaN
+
+        for (idx in start until n) {
+            val b = bars[idx]
+            var tr = b.volume / floatShares
+            tr = min(max(tr, 0.0), 0.95)
+            if (initialized) {
+                val keep = max(0.0, 1.0 - tr * CYQ_DECAY)
+                if (keep < 1.0) for (j in chips.indices) chips[j] *= keep
+            }
+            if (tr > 0) {
+                val peak = (b.high + b.low + b.close) / 3.0
+                addTriangle(chips, bins, step, pmin, b.low, b.high, peak, tr)
+                initialized = true
+            }
+            prev = cur
+            val r = scrOf(chips, pmin, step)
+            if (r == null) {
+                cur = Double.NaN
+                curP5 = Double.NaN
+                curP95 = Double.NaN
+            } else {
+                cur = r[0]; curP5 = r[1]; curP95 = r[2]
+            }
+        }
+        return doubleArrayOf(cur, prev, curP5, curP95)
+    }
+
+    private fun addTriangle(chips: DoubleArray, bins: Int, step: Double, pmin: Double,
+                            lo: Double, hi: Double, peakRaw: Double, amount: Double) {
+        if (hi <= lo) {
+            val idx = min(max(((lo - pmin) / step).toInt(), 0), bins - 1)
+            chips[idx] += amount
+            return
+        }
+        val i0 = min(max(((lo - pmin) / step).toInt(), 0), bins - 1)
+        val i1 = min(max(((hi - pmin) / step).toInt(), 0), bins - 1)
+        if (i1 <= i0) {
+            chips[i0] += amount
+            return
+        }
+        val peak = min(max(peakRaw, lo), hi)
+        val left = max(peak - lo, 1e-9)
+        val right = max(hi - peak, 1e-9)
+        var total = 0.0
+        val ws = DoubleArray(i1 - i0 + 1)
+        for (j in i0..i1) {
+            val price = pmin + (j + 0.5) * step
+            val w = if (price <= peak) (price - lo) / left else (hi - price) / right
+            ws[j - i0] = max(w, 0.0)
+            total += ws[j - i0]
+        }
+        if (total <= 0) {
+            chips[i0] += amount
+            return
+        }
+        for (j in i0..i1) chips[j] += amount * ws[j - i0] / total
+    }
+
+    /** 集中度 = (P95-P5)/(P95+P5)*100，分位数在档内线性插值。 */
+    private fun scrOf(chips: DoubleArray, pmin: Double, step: Double): DoubleArray? {
+        var total = 0.0
+        for (c in chips) total += c
+        if (total <= 0) return null
+        val t5 = total * 0.05
+        val t95 = total * 0.95
+        var acc = 0.0
+        var p5 = Double.NaN
+        var p95 = Double.NaN
+        for (j in chips.indices) {
+            val c = chips[j]
+            if (c <= 0) continue
+            val lo = pmin + j * step
+            val nxt = acc + c
+            if (p5.isNaN() && nxt >= t5) p5 = lo + (t5 - acc) / c * step
+            if (nxt >= t95) {
+                p95 = lo + (t95 - acc) / c * step
+                break
+            }
+            acc = nxt
+        }
+        if (p5.isNaN() || p95.isNaN() || p5 + p95 <= 0) return null
+        return doubleArrayOf((p95 - p5) / (p95 + p5) * 100.0, p5, p95)
+    }
+
+    private fun dropIncompleteToday(bars: List<Bar>, asOf: String): List<Bar> {
+        if (bars.isEmpty()) return bars
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US)
+        val now = java.util.Date()
+        val today = fmt.format(now).substring(0, 10)
+        val hm = fmt.format(now).substring(11)
+        if (bars.last().day != today || asOf < today) return bars
+        if (hm < "15:05") return bars.dropLast(1)
+        return bars
+    }
+
+    // ===== 拉取 =====
 
     private fun fetchStockList(onState: (String) -> Unit): List<Stock> {
         val total = getTotalCount()
         onState("列表总数约 $total 只，正在分页获取…")
-        val stocks = ArrayList<Stock>()
+        val out = ArrayList<Stock>()
         var page = 1
-        while (stocks.size < total) {
+        while (out.size < total) {
             val url = "$LIST_URL?${qs(mapOf("page" to page, "num" to 100, "sort" to "symbol", "asc" to 1, "node" to "hs_a"))}"
             val text = HttpUtil.get(url, REF)
             val arr = try { JSONArray(text) } catch (e: Exception) { JSONArray() }
@@ -124,39 +387,40 @@ object StockScreen {
                 val o = arr.optJSONObject(i) ?: continue
                 val code = o.optString("code")
                 val name = o.optString("name")
-                val nmc = o.optDouble("nmc", 0.0)
-                if (isMainBoard(code) && !name.uppercase().contains("ST") &&
-                    nmc > 0 && nmc >= NMC_MIN && nmc <= NMC_MAX
-                ) {
-                    stocks.add(Stock(code, name, toSymbol(code), nmc / 10000.0))
+                val nmc = o.optDouble("nmc", 0.0)   // 万元
+                if (isMainBoard(code) && !isExcluded(name) && nmc > 0) {
+                    out.add(Stock(code, name, toSymbol(code), round2(nmc / 10000.0), nmc * 10000.0))
                 }
             }
             if (arr.length() < 100) break
             page++
             Thread.sleep(80)
         }
-        return stocks
+        return out
     }
 
-    private fun getTotalCount(): Int {
-        return try {
-            HttpUtil.get("$COUNT_URL?${qs(mapOf("node" to "hs_a"))}", REF).trim().toIntOrNull() ?: 6000
-        } catch (e: Exception) {
-            6000
-        }
+    private fun getTotalCount(): Int = try {
+        HttpUtil.get("$COUNT_URL?${qs(mapOf("node" to "hs_a"))}", REF).trim().toIntOrNull() ?: 6000
+    } catch (e: Exception) {
+        6000
     }
 
     private fun fetchKline(symbol: String): List<Bar> {
         val url = "$KLINE_URL?${qs(mapOf("symbol" to symbol, "scale" to 240, "ma" to "no", "datalen" to K_FETCH_DAYS))}"
         val text = HttpUtil.get(url, null)
         val arr = try { JSONArray(text) } catch (e: Exception) { JSONArray() }
-        val bars = ArrayList<Bar>()
+        val bars = ArrayList<Bar>(arr.length())
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val day = o.optString("day").trim().substringBefore(" ")
-            val close = o.optDouble("close", Double.NaN)
-            if (day.isNotEmpty() && !close.isNaN()) bars.add(Bar(day, close))
+            val c = o.optDouble("close", Double.NaN)
+            if (day.isEmpty() || c.isNaN() || c <= 0) continue
+            bars.add(
+                Bar(day, o.optDouble("open", c), o.optDouble("high", c),
+                    o.optDouble("low", c), c, o.optDouble("volume", 0.0))
+            )
         }
+        bars.sortBy { it.day }
         return bars
     }
 
@@ -167,83 +431,18 @@ object StockScreen {
         return SH_MAIN.any { code.startsWith(it) } || SZ_MAIN.any { code.startsWith(it) }
     }
 
-    private fun toSymbol(code: String): String {
-        return if (code.firstOrNull()?.let { it in '5'..'6' } == true) "sh$code" else "sz$code"
+    private fun isExcluded(name: String): Boolean {
+        val up = name.uppercase().replace(" ", "")
+        return EXCLUDE_NAME.any { up.contains(it) }
     }
 
-    private fun qs(obj: Map<String, Any?>): String {
-        return obj.entries.joinToString("&") {
+    private fun toSymbol(code: String): String =
+        if (code.firstOrNull()?.let { it in '5'..'6' } == true) "sh$code" else "sz$code"
+
+    private fun qs(obj: Map<String, Any?>): String =
+        obj.entries.joinToString("&") {
             URLEncoder.encode(it.key, "UTF-8") + "=" + URLEncoder.encode(it.value?.toString() ?: "", "UTF-8")
         }
-    }
 
-    // ===== 技术指标 =====
-
-    private fun calcMA(vals: DoubleArray, p: Int): DoubleArray {
-        val ma = DoubleArray(vals.size) { Double.NaN }
-        var sum = 0.0
-        for (i in vals.indices) {
-            sum += vals[i]
-            if (i >= p) sum -= vals[i - p]
-            if (i >= p - 1) ma[i] = sum / p
-        }
-        return ma
-    }
-
-    private fun calcEMA(vals: DoubleArray, p: Int): DoubleArray {
-        val ema = DoubleArray(vals.size)
-        if (vals.isEmpty()) return ema
-        ema[0] = vals[0]
-        val k = 2.0 / (p + 1)
-        for (i in 1 until vals.size) ema[i] = vals[i] * k + ema[i - 1] * (1 - k)
-        return ema
-    }
-
-    private fun macdGoldenLatest(closes: DoubleArray): Boolean {
-        val n = closes.size
-        if (n < 2) return false
-        val eFast = calcEMA(closes, MACD_FAST)
-        val eSlow = calcEMA(closes, MACD_SLOW)
-        val dif = DoubleArray(n)
-        for (i in 0 until n) dif[i] = eFast[i] - eSlow[i]
-        val dea = calcEMA(dif, MACD_SIGNAL)
-        val i = n - 1
-        return dif[i] > dea[i] && dif[i - 1] <= dea[i - 1]
-    }
-
-    private fun countGoldenCross(ma5: DoubleArray, ma10: DoubleArray, window: Int): Pair<Int, Boolean> {
-        val n = ma5.size
-        if (n < window + 1) return Pair(0, false)
-        val start = n - window
-        var count = 0
-        var latest = false
-        for (i in maxOf(1, start) until n) {
-            if (ma5[i].isNaN() || ma10[i].isNaN() || ma5[i - 1].isNaN() || ma10[i - 1].isNaN()) continue
-            if (ma5[i] > ma10[i] && ma5[i - 1] <= ma10[i - 1]) {
-                count++
-                if (i == n - 1) latest = true
-            }
-        }
-        return Pair(count, latest)
-    }
-
-    private fun checkSignal(closes: DoubleArray): Boolean {
-        if (closes.size < K_DAYS) return false
-        val ma5 = calcMA(closes, 5)
-        val ma10 = calcMA(closes, 10)
-        val (count, latest) = countGoldenCross(ma5, ma10, WINDOW)
-        if (!(latest && count == TARGET)) return false
-        return macdGoldenLatest(closes)
-    }
-
-    private fun hasLimitUp(closes: DoubleArray, window: Int): Boolean {
-        val n = closes.size
-        if (n < 2) return false
-        val start = maxOf(1, n - window)
-        for (i in start until n) {
-            if (closes[i - 1] <= 0) continue
-            if ((closes[i] - closes[i - 1]) / closes[i - 1] >= 0.098) return true
-        }
-        return false
-    }
+    private fun round2(v: Double): Double = Math.round(v * 100.0) / 100.0
 }
