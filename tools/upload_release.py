@@ -27,18 +27,32 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RELEASE_DIR = os.path.join(ROOT, "release")
 
 # 本地文件名 -> 发布文件名（发布名用 ASCII + 版本号，避免下载链接里全是百分号编码）
+# 第一个元素是候选本地文件名列表：build_android.bat 复制出来的是 limitup-gap.apk，
+# 手动整理时常改成中文名，两个都认，避免「构建完再发布」时静默跳过 apk。
 ASSETS = [
-    ("涨停缺口选股.apk", "limitup-gap-%s.apk"),
-    ("涨停缺口选股.exe", "limitup-gap-%s.exe"),
+    (("涨停缺口选股.apk", "limitup-gap.apk"), "limitup-gap-%s.apk"),
+    (("涨停缺口选股.exe", "limitup-gap.exe"), "limitup-gap-%s.exe"),
 ]
 
 DEFAULT_BODY = """沪深主板「涨停 + 次日跳空缺口 + 筹码收敛」四条件选股器。
 
 **信号条件**（四条同时满足才算命中）
 - 股价 3 元 ~ 25 元
-- 最近涨停距今 ≥ 2 个交易日，且非连板
-- 涨停次日跳空，且至今未回补
+- 涨停日恰好是 2 个交易日前，且非连板
+- 涨停次日跳空，且到今天为止缺口上方只有 2 根 K 线、未回补
 - 当日筹码集中度小于上一日
+
+**交易节奏**（这是一条定时信号，不是区间筛选）
+
+| 交易日 | 发生什么 | 动作 |
+|--------|----------|------|
+| T | 涨停（此前不是涨停） | — |
+| T+1 | 向上跳空，缺口形成 | 观察 |
+| T+2 | 缺口上方第 2 根 K 线 | **收盘后运行，进场** |
+| T+3 | 缺口上方第 3 根 K 线 | **找机会离场** |
+
+因为信号只在一天成立，命中数逐日波动很大（有些天 9 只，有些天 0 只），
+这是策略本身的性质。
 
 **下载**
 - `limitup-gap-%s.apk` —— Android 版，包名 `com.example.limitupgap`，可与其他版本共存安装
@@ -47,17 +61,55 @@ DEFAULT_BODY = """沪深主板「涨停 + 次日跳空缺口 + 筹码收敛」�
 **说明**
 - Android 版首次安装需允许「安装未知来源应用」
 - 输出只包含四条条件全部满足的个股
+- 筹码集中度按通达信 CYQ 口径自行实现（三角形分布 + 换手衰减），
+  绝对值与商业软件不会逐位一致，但方向性比较可靠
 - 数据源为新浪财经公开接口，本项目只做数据筛选，不构成任何投资建议
 """
 
 
-def get_token():
-    """从 git 凭据助手取 token。只在内存里用，不落盘、不打印。"""
+def _gcm_exe():
+    """找出全局配置里的 GCM 可执行文件路径。"""
     try:
-        out = subprocess.run(["git", "credential", "fill"],
-                             input="protocol=https\nhost=github.com\n\n",
-                             capture_output=True, text=True, encoding="utf-8")
-    except FileNotFoundError:
+        out = subprocess.run(["git", "config", "--global", "--get",
+                              "credential.helper"],
+                             capture_output=True, text=True, encoding="utf-8",
+                             timeout=15)
+    except Exception:            # noqa: BLE001
+        return ""
+    v = out.stdout.strip()
+    if v.startswith("!"):
+        v = v[1:].strip()
+    v = v.strip('"')
+    return v if v and os.path.exists(v) else ""
+
+
+def get_token():
+    """
+    从 git 凭据助手取 token。只在内存里用，不落盘、不打印。
+
+    优先直接调用 GCM 可执行文件：本机仓库级配了 `helper-selector`，
+    `git credential fill` 会卡在交互式选择器上（实测挂起 6 分钟无输出）。
+    直接 `git-credential-manager.exe get` 则是秒回。
+    """
+    payload = "protocol=https\nhost=github.com\n\n"
+
+    gcm = _gcm_exe()
+    if gcm:
+        try:
+            out = subprocess.run([gcm, "get"], input=payload,
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", timeout=30)
+            for line in out.stdout.splitlines():
+                if line.startswith("password="):
+                    return line[len("password="):].strip()
+        except Exception:        # noqa: BLE001
+            pass
+
+    try:                          # 兜底，必须带超时，否则可能永久挂住
+        out = subprocess.run(["git", "credential", "fill"], input=payload,
+                             capture_output=True, text=True,
+                             encoding="utf-8", timeout=30)
+    except Exception:            # noqa: BLE001
         return ""
     for line in out.stdout.splitlines():
         if line.startswith("password="):
@@ -145,10 +197,15 @@ def main():
         print("已创建 release %s（target=%s, id=%d）" % (args.tag, target, rel["id"]))
 
     have = {a["name"] for a in rel.get("assets", [])}
-    for local, pattern in ASSETS:
-        path = os.path.join(RELEASE_DIR, local)
-        if not os.path.exists(path):
-            print("跳过（文件不存在）：%s" % path)
+    for locals_, pattern in ASSETS:
+        path = ""
+        for cand in locals_:
+            p = os.path.join(RELEASE_DIR, cand)
+            if os.path.exists(p):
+                path = p
+                break
+        if not path:
+            print("跳过（文件不存在）：%s" % " / ".join(locals_))
             continue
         name = pattern % ver
         if name in have:
@@ -159,8 +216,9 @@ def main():
         code, txt = api("POST", url, token, ctype="application/octet-stream",
                         file_path=path)
         if code in (200, 201):
-            print("上传成功：%s（%.2f MB）"
-                  % (name, os.path.getsize(path) / 1048576))
+            print("上传成功：%s（%.2f MB，本地文件名 %s）"
+                  % (name, os.path.getsize(path) / 1048576,
+                     os.path.basename(path)))
         else:
             print("上传失败 %s %d：%s" % (name, code, txt[:300]))
 

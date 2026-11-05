@@ -196,6 +196,20 @@ python selftest.py
 双击 `build_pc.bat`，或在 `pc/` 下执行 `python build_exe.py`。
 单文件 exe 输出到桌面，文件名形如 `涨停缺口选股_20261105_153000.exe`。
 
+### 发布到 GitHub Releases
+
+```bash
+python tools/upload_release.py v3.1
+```
+
+自动打 tag、上传 `release/` 下的 apk 与 exe，并打印发布页和直链。
+附件用 ASCII 文件名（`limitup-gap-3.1.apk`），避免下载链接里出现百分号编码。
+脚本是幂等的，重复执行不会重复上传。
+
+> 取凭据时脚本直接调用 GCM 可执行文件，**不走 `git credential fill`**：
+> 本机仓库级配了 `helper-selector`，后者会卡在交互式选择器上
+> （实测挂起 6 分钟、无任何输出）。直接 `git-credential-manager.exe get` 是秒回。
+
 ---
 
 ## 五、Android 版
