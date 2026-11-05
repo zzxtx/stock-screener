@@ -127,6 +127,7 @@ class ScreenService : Service() {
         put("gapDate", r.gapDate)
         put("gapPct", r.gapPct)
         put("gapAge", r.gapAge)
+        put("barsAbove", r.barsAbove)
         put("gapRange", r.gapRange)
         put("scrToday", r.scrToday)
         put("scrPrev", r.scrPrev)

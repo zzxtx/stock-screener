@@ -5,8 +5,11 @@
 筛选条件（全部满足才算命中）：
   0. 市场：沪深主板（沪 600/601/603/605，深 000/001/002），剔除 ST / *ST / 退市
   1. 股价：3 元 < 收盘价 < 25 元
-  2. 涨停：最近一个涨停日 T 至少在 2 个交易日之前，且为「非连板」（T-1 日不是涨停）
-  3. 缺口：涨停次日（T+1）出现向上跳空缺口，且至今未回补
+  2. 涨停：涨停日 T 恰好是 2 个交易日前，且为「非连板」（T-1 日不是涨停）
+  3. 缺口：T+1 跳空，且到最新交易日为止，缺口上方（含缺口当根）只有 2 根 K 线
+
+  换句话说：这是给「涨停 → 次日跳空 → 第三日进场」这条节奏定的定时信号。
+  涨停日 T、缺口日 T+1、运行当日 T+2（即今天进场），次日 T+3 找机会离场。
   4. 筹码：当日筹码集中度小于上一日（筹码在收敛）
 
 筹码集中度采用通达信 CYQ 口径：
@@ -42,15 +45,13 @@ EXCLUDE_NAME_KEYWORDS = ("ST", "退")
 PRICE_MIN = 3.0           # 不含
 PRICE_MAX = 25.0          # 不含
 
-# --- 条件 2：涨停 ---
+# --- 条件 2 / 3：涨停 + 缺口位置 ---
 LIMIT_UP_PCT = 0.098      # 主板 10% 口径，按涨幅 >= 9.8% 近似
-LIMIT_UP_MIN_AGE = 2      # 涨停日距最新交易日至少 N 天（「后两日」）
-LIMIT_UP_WINDOW = 20      # 只在最近 N 个交易日内找涨停
+# 缺口上方（含缺口当根）的 K 线根数。设 2 表示：
+#   · 缺口落在倒数第 2 根 K 线
+#   · 涨停日就是它前一根（倒数第 3 根），即涨停恰好 2 个交易日前
+BARS_ABOVE_GAP = 2
 NO_CONSECUTIVE = True     # 非连板：涨停前一日不能再是涨停
-
-# --- 条件 3：缺口 ---
-GAP_OFFSET_MIN = 1        # 缺口最早出现在涨停后第 1 天
-GAP_OFFSET_MAX = 1        # 缺口最晚出现在涨停后第 1 天（1/1 = 仅认「次日跳空」）
 GAP_MIN_PCT = 0.2         # 缺口幅度下限 %
 GAP_ALLOW_PARTIAL = False # False=完全未回补；True=允许部分回补
 
@@ -87,8 +88,8 @@ KLINE_HEADERS = {"User-Agent": UA}
 # 四条信号条件（顺序即漏斗顺序）
 CONDITIONS = [
     ("股价", "3 元 < 股价 < 25 元"),
-    ("涨停", "2 日前涨停且非连板"),
-    ("缺口", "涨停次日跳空且未回补"),
+    ("涨停", "涨停恰在 2 个交易日前"),
+    ("缺口", "缺口上方仅 2 根 K 线"),
     ("筹码", "筹码集中度小于上一日"),
 ]
 COND_NAMES = [c[0] for c in CONDITIONS]
@@ -225,63 +226,60 @@ def is_limit_up(bars, i):
     return (bars[i]["close"] - prev) / prev >= LIMIT_UP_PCT
 
 
-def find_limit_up(bars):
+def limit_up_index(bars):
     """
-    找最近的涨停日，返回下标；要求满足：
-      · 距最新交易日 >= LIMIT_UP_MIN_AGE（「后两日」）
-      · 在最近 LIMIT_UP_WINDOW 个交易日内
-      · 非连板（涨停前一日不是涨停）
+    涨停日被缺口位置钉死：缺口上方只有 BARS_ABOVE_GAP 根 K 线，
+    所以缺口在倒数第 BARS_ABOVE_GAP 根，涨停就在它前一根。
+
+    返回涨停日下标；不满足「该位置是涨停」「非连板」时返回 None。
     """
     n = len(bars)
-    latest_ok = n - 1 - LIMIT_UP_MIN_AGE
-    earliest = max(1, n - 1 - LIMIT_UP_WINDOW)
-    if latest_ok < earliest:
+    gap_i = n - BARS_ABOVE_GAP          # 缺口应出现的下标
+    t = gap_i - 1                        # 涨停日在缺口前一根
+    if t < 1:
         return None
-    for i in range(latest_ok, earliest - 1, -1):
-        if not is_limit_up(bars, i):
-            continue
-        if NO_CONSECUTIVE and is_limit_up(bars, i - 1):
-            return None          # 最近这次涨停是连板，不符合「非连板」
-        return i
-    return None
+    if not is_limit_up(bars, t):
+        return None
+    if NO_CONSECUTIVE and is_limit_up(bars, t - 1):
+        return None                      # 连板
+    return t
 
 
 # ================== 条件 3：缺口 ==================
 
 def find_gap_after_limit_up(bars, t):
     """
-    只在涨停次日（T+1）找向上跳空缺口，且要求至今未回补。
+    缺口只认「涨停次日」，且位置固定：当天起算到最新一根，缺口上方恰好
+    BARS_ABOVE_GAP 根 K 线（含缺口当根）。因此缺口下标 = t + 1。
+
     向上跳空缺口：当日最低价 > 前一日最高价，缺口区间 = [前一日最高, 当日最低]。
-    返回最近的一个符合条件缺口；没有则返回 None。
+    未回补：缺口之后所有 K 线的最低价都没进入该区间。
     """
     n = len(bars)
-    lo = t + GAP_OFFSET_MIN
-    hi = min(t + GAP_OFFSET_MAX, n - 1)
-    for i in range(hi, lo - 1, -1):
-        if i < 1:
-            continue
-        prev_high = bars[i - 1]["high"]
-        low = bars[i]["low"]
-        if prev_high <= 0 or low <= prev_high:
-            continue
-        gap_pct = (low - prev_high) / prev_high * 100.0
-        if gap_pct < GAP_MIN_PCT:
-            continue
-        after = bars[i + 1:]
-        if not after:
-            continue
-        lowest_after = min(b["low"] for b in after)
+    i = t + 1
+    if i < 1 or i >= n:
+        return None
+    prev_high = bars[i - 1]["high"]
+    low = bars[i]["low"]
+    if prev_high <= 0 or low <= prev_high:
+        return None
+    gap_pct = (low - prev_high) / prev_high * 100.0
+    if gap_pct < GAP_MIN_PCT:
+        return None
+    after = bars[i + 1:]
+    lowest_after = min((b["low"] for b in after), default=None)
+    if lowest_after is not None:
         limit = prev_high if GAP_ALLOW_PARTIAL else low
         if lowest_after <= limit:
-            continue
-        return {
-            "gap_index": i,
-            "gap_date": bars[i]["day"],
-            "gap_pct": round(gap_pct, 2),
-            "gap_age": n - 1 - i,
-            "gap_range": "%.2f ~ %.2f" % (prev_high, low),
-        }
-    return None
+            return None
+    return {
+        "gap_index": i,
+        "gap_date": bars[i]["day"],
+        "gap_pct": round(gap_pct, 2),
+        "gap_age": n - 1 - i,
+        "bars_above": n - i,
+        "gap_range": "%.2f ~ %.2f" % (prev_high, low),
+    }
 
 
 # ================== 条件 4：筹码集中度（CYQ） ==================
@@ -461,7 +459,7 @@ def evaluate(c, as_of, stats, lock):
     ok_price = (PRICE_MIN + EPS) < close < (PRICE_MAX - EPS)
 
     # ---- 条件 2：涨停 ----
-    t = find_limit_up(bars)
+    t = limit_up_index(bars)
     ok_limit = t is not None
 
     # ---- 条件 3：缺口 ----
@@ -498,6 +496,7 @@ def evaluate(c, as_of, stats, lock):
         "gap_date": gap["gap_date"] if gap else "",
         "gap_pct": gap["gap_pct"] if gap else "",
         "gap_age": gap["gap_age"] if gap else "",
+        "bars_above": gap["bars_above"] if gap else "",
         "gap_range": gap["gap_range"] if gap else "",
         "scr_today": round(scr_today, 2) if scr_today is not None else "",
         "scr_prev": round(scr_prev, 2) if scr_prev is not None else "",

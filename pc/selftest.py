@@ -26,7 +26,7 @@ def d(i):
 
 
 def build(flat=140, base=10.0, lu_mult=1.10, cons_lo=0.995, cons_hi=1.005,
-          vol_base=4e7, vol_cons=4e7, hold_days=2, gap_extra=1.005,
+          vol_base=4e7, vol_cons=4e7, hold_days=1, gap_extra=1.005,
           prev_limit=False, fill_gap=False, wide_last=False,
           gap_at_limit_up=False):
     """按固定剧本生成 K 线；参数用来故意破坏某一条条件。"""
@@ -72,7 +72,8 @@ def build(flat=140, base=10.0, lu_mult=1.10, cons_lo=0.995, cons_hi=1.005,
         if fill_gap and k == hold_days - 1:
             lo = t_close * 0.999            # 跌回缺口区，构成回补
         if wide_last and k == hold_days - 1:
-            lo, hi = (gap_top if gap_top else t_close), c * 1.12   # 最后一天放宽带
+            # 最后一天放宽带，但最低价仍在缺口上沿之上，避免顺带把缺口回补了
+            lo, hi = (gap_top * 1.002 if gap_top else t_close), c * 1.12
         add(c, hi, lo, c, vol_cons)
 
     for i, b in enumerate(bars):
@@ -102,10 +103,10 @@ def main():
     check("score == %d" % total, r is not None and r["score"] == total,
           "" if r is None else "score=%d 未满足=%s" % (r["score"], r["missing"] or "无"))
     if r:
-        print("      收 %.2f | 涨停 %s（%s 日前）| 缺口 %s +%.2f%%（%s 日前）"
+        print("      收 %.2f | 涨停 %s（%s 日前）| 缺口 %s +%.2f%% | 缺口上方 %s 根 K 线"
               "| 集中度 %s → %s"
               % (r["close"], r["limit_date"], r["limit_age"], r["gap_date"],
-                 r["gap_pct"], r["gap_age"], r["scr_prev"], r["scr_today"]))
+                 r["gap_pct"], r["bars_above"], r["scr_prev"], r["scr_today"]))
 
     print("== 2. 股价边界（3 < 股价 < 25） ==")
     for name, kw, want in [
@@ -122,10 +123,14 @@ def main():
     check("连板（前一日也涨停）淘汰", rr is not None and not rr["flags"]["涨停"],
           "" if rr is None else "涨停距今 %s 日" % rr["limit_age"])
     rr = run_case(build(hold_days=0))
-    check("涨停仅 1 日前 淘汰", rr is not None and not rr["flags"]["涨停"],
+    check("涨停仅 1 日前（缺口上方 1 根）淘汰", rr is not None and not rr["flags"]["涨停"],
           "" if rr is None else "涨停距今 %s 日" % rr["limit_age"])
     rr = run_case(build(hold_days=1))
-    check("涨停 2 日前 通过", rr is not None and rr["flags"]["涨停"],
+    check("涨停 2 日前（缺口上方 2 根）通过", rr is not None and rr["flags"]["涨停"],
+          "" if rr is None else "涨停距今 %s 日，缺口上方 %s 根"
+          % (rr["limit_age"], rr["bars_above"]))
+    rr = run_case(build(hold_days=2))
+    check("涨停 3 日前（缺口上方 3 根）淘汰", rr is not None and not rr["flags"]["涨停"],
           "" if rr is None else "涨停距今 %s 日" % rr["limit_age"])
 
     print("== 4. 缺口（只认涨停次日） ==")
@@ -134,8 +139,8 @@ def main():
           "（新规则只认 T+1 跳空）")
     rr = run_case(build())
     check("缺口在涨停次日 通过", rr is not None and rr["flags"]["缺口"],
-          "" if rr is None else "缺口 %s +%.2f%%（%s 日前）"
-          % (rr["gap_date"], rr["gap_pct"], rr["gap_age"]))
+          "" if rr is None else "缺口 %s +%.2f%%，上方 %s 根"
+          % (rr["gap_date"], rr["gap_pct"], rr["bars_above"]))
     rr = run_case(build(fill_gap=True))
     check("缺口已回补 淘汰", rr is not None and not rr["flags"]["缺口"], "")
     rr = run_case(build(gap_extra=1.001))

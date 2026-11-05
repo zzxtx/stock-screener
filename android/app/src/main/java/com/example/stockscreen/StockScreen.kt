@@ -13,8 +13,11 @@ import kotlin.math.min
  *
  * 四条信号条件（同时满足才算命中）：
  *   1 股价 3 < 收盘 < 25
- *   2 最近涨停日 T 距最新 >= 2 个交易日，且非连板（T-1 不是涨停）
- *   3 涨停次日（T+1）出现向上跳空缺口，且至今未回补
+ *   2 涨停日 T 恰好 2 个交易日前，且非连板（T-1 不是涨停）
+ *   3 T+1 跳空，且到最新一根为止缺口上方（含缺口当根）只有 2 根 K 线
+ *
+ * 本质是「涨停 -> 次日跳空 -> 第三日进场，次日离场」的定时信号：
+ * 涨停 T、缺口 T+1、运行当日 T+2、离场 T+3。
  *   4 当日筹码集中度 < 上一日（筹码收敛）
  *
  * 与 PC 版 pc/screen.py 的口径完全一致，包含 CYQ 筹码分布模型。
@@ -25,11 +28,9 @@ object StockScreen {
     const val PRICE_MIN = 3.0
     const val PRICE_MAX = 25.0
     const val LIMIT_UP_PCT = 0.098
-    const val LIMIT_UP_MIN_AGE = 2
-    const val LIMIT_UP_WINDOW = 20
+    /** 缺口上方（含缺口当根）的 K 线根数：2 表示缺口在倒数第 2 根，涨停在其前一根 */
+    const val BARS_ABOVE_GAP = 2
     const val NO_CONSECUTIVE = true
-    const val GAP_OFFSET_MIN = 1
-    const val GAP_OFFSET_MAX = 1
     const val GAP_MIN_PCT = 0.2
     const val GAP_ALLOW_PARTIAL = false
     const val CYQ_WINDOW = 90
@@ -58,7 +59,8 @@ object StockScreen {
         val code: String, val name: String, val baseDate: String,
         val close: Double, val chgPct: Double, val nmcYi: Double,
         val limitDate: String, val limitAge: Int,
-        val gapDate: String, val gapPct: Double, val gapAge: Int, val gapRange: String,
+        val gapDate: String, val gapPct: Double, val gapAge: Int,
+        val barsAbove: Int, val gapRange: String,
         val scrToday: Double, val scrPrev: Double, val scrDelta: Double,
         val scrP5: Double, val scrP95: Double,
         val score: Int, val missing: String
@@ -68,7 +70,7 @@ object StockScreen {
                            val low: Double, val close: Double, val volume: Double)
 
     private data class Gap(val index: Int, val date: String, val pct: Double,
-                           val age: Int, val range: String)
+                           val age: Int, val barsAbove: Int, val range: String)
 
     interface Listener {
         fun onState(state: String)
@@ -172,7 +174,7 @@ object StockScreen {
         val okPrice = close > PRICE_MIN + EPS && close < PRICE_MAX - EPS
 
         // 2 涨停
-        val t = findLimitUp(bars)
+        val t = limitUpIndex(bars)
         // 3 缺口（仅次日）
         val gap = if (t >= 0) findGapAfterLimitUp(bars, t) else null
 
@@ -196,7 +198,8 @@ object StockScreen {
             limitDate = if (t >= 0) bars[t].day else "",
             limitAge = if (t >= 0) n - 1 - t else 0,
             gapDate = gap?.date ?: "", gapPct = gap?.pct ?: 0.0,
-            gapAge = gap?.age ?: 0, gapRange = gap?.range ?: "",
+            gapAge = gap?.age ?: 0, barsAbove = gap?.barsAbove ?: 0,
+            gapRange = gap?.range ?: "",
             scrToday = if (scrToday.isNaN()) 0.0 else round2(scrToday),
             scrPrev = if (scrPrev.isNaN()) 0.0 else round2(scrPrev),
             scrDelta = if (scrToday.isNaN() || scrPrev.isNaN()) 0.0 else round2(scrToday - scrPrev),
@@ -215,42 +218,40 @@ object StockScreen {
         return (bars[i].close - prev) / prev >= LIMIT_UP_PCT
     }
 
-    /** 返回涨停日下标，找不到返回 -1。 */
-    private fun findLimitUp(bars: List<Bar>): Int {
+    /**
+     * 涨停日被缺口位置钉死：缺口在倒数第 BARS_ABOVE_GAP 根，涨停在它前一根。
+     * 返回涨停日下标，不满足返回 -1。
+     */
+    private fun limitUpIndex(bars: List<Bar>): Int {
         val n = bars.size
-        val latestOk = n - 1 - LIMIT_UP_MIN_AGE
-        val earliest = max(1, n - 1 - LIMIT_UP_WINDOW)
-        if (latestOk < earliest) return -1
-        for (i in latestOk downTo earliest) {
-            if (!isLimitUp(bars, i)) continue
-            if (NO_CONSECUTIVE && isLimitUp(bars, i - 1)) return -1
-            return i
-        }
-        return -1
+        val gapIdx = n - BARS_ABOVE_GAP
+        val t = gapIdx - 1
+        if (t < 1) return -1
+        if (!isLimitUp(bars, t)) return -1
+        if (NO_CONSECUTIVE && isLimitUp(bars, t - 1)) return -1
+        return t
     }
 
     // ===== 缺口 =====
 
+    /** 缺口只认涨停次日，位置固定为 t+1。 */
     private fun findGapAfterLimitUp(bars: List<Bar>, t: Int): Gap? {
         val n = bars.size
-        val lo = t + GAP_OFFSET_MIN
-        val hi = min(t + GAP_OFFSET_MAX, n - 1)
-        for (i in hi downTo lo) {
-            if (i < 1) continue
-            val prevHigh = bars[i - 1].high
-            val low = bars[i].low
-            if (prevHigh <= 0 || low <= prevHigh) continue
-            val pct = (low - prevHigh) / prevHigh * 100.0
-            if (pct < GAP_MIN_PCT) continue
-            var lowestAfter = Double.MAX_VALUE
-            for (j in i + 1 until n) if (bars[j].low < lowestAfter) lowestAfter = bars[j].low
-            if (lowestAfter == Double.MAX_VALUE) continue
+        val i = t + 1
+        if (i < 1 || i >= n) return null
+        val prevHigh = bars[i - 1].high
+        val low = bars[i].low
+        if (prevHigh <= 0 || low <= prevHigh) return null
+        val pct = (low - prevHigh) / prevHigh * 100.0
+        if (pct < GAP_MIN_PCT) return null
+        var lowestAfter = Double.MAX_VALUE
+        for (j in i + 1 until n) if (bars[j].low < lowestAfter) lowestAfter = bars[j].low
+        if (lowestAfter != Double.MAX_VALUE) {
             val limit = if (GAP_ALLOW_PARTIAL) prevHigh else low
-            if (lowestAfter <= limit) continue
-            return Gap(i, bars[i].day, round2(pct), n - 1 - i,
-                String.format(java.util.Locale.US, "%.2f ~ %.2f", prevHigh, low))
+            if (lowestAfter <= limit) return null
         }
-        return null
+        return Gap(i, bars[i].day, round2(pct), n - 1 - i, n - i,
+            String.format(java.util.Locale.US, "%.2f ~ %.2f", prevHigh, low))
     }
 
     // ===== 筹码集中度（CYQ） =====

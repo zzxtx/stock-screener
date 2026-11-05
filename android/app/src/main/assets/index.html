@@ -49,15 +49,15 @@
 <body>
 <div class="wrap">
   <h1>涨停缺口选股</h1>
-  <div class="sub">沪深主板 · 数据源新浪财经 · 后台运行</div>
+  <div class="sub">沪深主板 · 涨停次日跳空 · 今日进场 · 次日离场</div>
 
   <div class="card">
     <h2>筛选条件</h2>
     <ul class="conds">
       <li><span class="cond-k">市场</span><span class="cond-v">沪深主板（沪 600/601/603/605，深 000/001/002），剔除 ST</span></li>
       <li><span class="cond-k">股价</span><span class="cond-v">3 元 &lt; 收盘价 &lt; 25 元</span></li>
-      <li><span class="cond-k">涨停</span><span class="cond-v">最近涨停距今 ≥ 2 个交易日，且非连板</span></li>
-      <li><span class="cond-k">缺口</span><span class="cond-v">涨停<b>次日</b>跳空，且至今未回补</span></li>
+      <li><span class="cond-k">涨停</span><span class="cond-v">涨停<b>恰在 2 个交易日前</b>，且非连板</span></li>
+      <li><span class="cond-k">缺口</span><span class="cond-v">涨停次日跳空，且到今天为止<b>缺口上方只有 2 根 K 线</b></span></li>
       <li><span class="cond-k">筹码</span><span class="cond-v">当日筹码集中度小于上一日（收敛）</span></li>
     </ul>
   </div>
@@ -88,7 +88,7 @@ const $ = id => document.getElementById(id);
 const COND = [
   ['股价', '股价 3~25'],
   ['涨停', '2日前涨停·非连板'],
-  ['缺口', '涨停次日跳空'],
+  ['缺口', '缺口上方仅2根K线'],
   ['筹码', '集中度收敛']
 ];
 
@@ -101,7 +101,7 @@ function initDate() {
 function stockCard(r) {
   let tags = '';
   if (r.limitDate) tags += '<span class="tag limit">涨停 ' + r.limitDate + ' · ' + r.limitAge + '日前</span>';
-  if (r.gapDate) tags += '<span class="tag gap">缺口 ' + r.gapDate + ' +' + r.gapPct.toFixed(2) + '%</span>';
+  if (r.gapDate) tags += '<span class="tag gap">缺口 ' + r.gapDate + ' +' + r.gapPct.toFixed(2) + '%，上方 ' + r.barsAbove + ' 根</span>';
   tags += '<span class="tag scr">集中度 ' + r.scrPrev.toFixed(2) + ' → ' + r.scrToday.toFixed(2) + '</span>';
   tags += '<span class="tag">流通 ' + r.nmcYi.toFixed(0) + '亿</span>';
   const cls = r.chgPct >= 0 ? 'up' : 'down';
