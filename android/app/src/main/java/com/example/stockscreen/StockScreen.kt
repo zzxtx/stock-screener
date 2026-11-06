@@ -13,7 +13,8 @@ import kotlin.math.min
  *
  * 四条信号条件（同时满足才算命中）：
  *   1 股价 3 < 收盘 < 25
- *   2 涨停日 T 恰好 2 个交易日前，且非连板（T-1 不是涨停）
+ *   2 涨停日 T 恰好 2 个交易日前，且 T 是「首板」（T-1 不是涨停）、
+ *     「非一字板」（当日盘中打开过，最低价明显低于收盘价）
  *   3 T+1 跳空，且到最新一根为止缺口上方（含缺口当根）只有 2 根 K 线
  *
  * 本质是「涨停 -> 次日跳空 -> 第三日进场，次日离场」的定时信号：
@@ -30,8 +31,13 @@ object StockScreen {
     const val LIMIT_UP_PCT = 0.098
     /** 缺口上方（含缺口当根）的 K 线根数：2 表示缺口在倒数第 2 根，涨停在其前一根 */
     const val BARS_ABOVE_GAP = 2
-    const val NO_CONSECUTIVE = true
-    /** 缺口日（T+1）本身不能是涨停：否则那根涨停板的上一日必然也是涨停，属连板 */
+    /** 首板：涨停日 T 的前一日不能再是涨停（取代原来的「非连板」说法） */
+    const val FIRST_BOARD = true
+    /** 非一字板：T 当日不能开盘即封死、全天不打开 */
+    const val NOT_YIZI_BAN = true
+    /** 最低价与收盘价的落差小于这个百分比 → 判为一字板 */
+    const val YIZI_TOL_PCT = 0.2
+    /** 缺口日（T+1）本身不能是涨停（属缺口条件，不算「首板」范畴） */
     const val GAP_DAY_NOT_LIMIT_UP = true
     const val GAP_MIN_PCT = 0.2
     const val GAP_ALLOW_PARTIAL = false
@@ -60,7 +66,7 @@ object StockScreen {
     data class Row(
         val code: String, val name: String, val baseDate: String,
         val close: Double, val chgPct: Double, val nmcYi: Double,
-        val limitDate: String, val limitAge: Int,
+        val limitDate: String, val limitAge: Int, val limitBodyPct: Double,
         val gapDate: String, val gapPct: Double, val gapDayChg: Double,
         val gapAge: Int, val barsAbove: Int, val gapRange: String,
         val scrToday: Double, val scrPrev: Double, val scrDelta: Double,
@@ -200,6 +206,8 @@ object StockScreen {
             close = round2(close), chgPct = round2(chg), nmcYi = c.nmcYi,
             limitDate = if (t >= 0) bars[t].day else "",
             limitAge = if (t >= 0) n - 1 - t else 0,
+            limitBodyPct = if (t >= 0)
+                round2((bars[t].close - bars[t].low) / bars[t].close * 100.0) else 0.0,
             gapDate = gap?.date ?: "", gapPct = gap?.pct ?: 0.0,
             gapDayChg = gap?.dayChg ?: 0.0,
             gapAge = gap?.age ?: 0, barsAbove = gap?.barsAbove ?: 0,
@@ -222,9 +230,16 @@ object StockScreen {
         return (bars[i].close - prev) / prev >= LIMIT_UP_PCT
     }
 
+    /** 一字板：开盘即封死涨停、全天不打开 → 最低价 == 收盘价。 */
+    private fun isYiziBan(bars: List<Bar>, i: Int): Boolean {
+        val b = bars[i]
+        if (b.close <= 0) return false
+        return (b.close - b.low) / b.close * 100.0 < YIZI_TOL_PCT
+    }
+
     /**
      * 涨停日被缺口位置钉死：缺口在倒数第 BARS_ABOVE_GAP 根，涨停在它前一根。
-     * 返回涨停日下标，不满足返回 -1。
+     * 返回涨停日下标；不满足「该位置是涨停」「首板」「非一字板」时返回 -1。
      */
     private fun limitUpIndex(bars: List<Bar>): Int {
         val n = bars.size
@@ -232,7 +247,8 @@ object StockScreen {
         val t = gapIdx - 1
         if (t < 1) return -1
         if (!isLimitUp(bars, t)) return -1
-        if (NO_CONSECUTIVE && isLimitUp(bars, t - 1)) return -1
+        if (FIRST_BOARD && isLimitUp(bars, t - 1)) return -1     // T-1 也涨停 -> 不是首板
+        if (NOT_YIZI_BAN && isYiziBan(bars, t)) return -1        // 一字板
         return t
     }
 

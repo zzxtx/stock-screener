@@ -124,6 +124,7 @@ class ScreenService : Service() {
         put("nmcYi", r.nmcYi)
         put("limitDate", r.limitDate)
         put("limitAge", r.limitAge)
+        put("limitBodyPct", r.limitBodyPct)
         put("gapDate", r.gapDate)
         put("gapPct", r.gapPct)
         put("gapDayChg", r.gapDayChg)

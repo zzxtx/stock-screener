@@ -56,7 +56,7 @@
     <ul class="conds">
       <li><span class="cond-k">市场</span><span class="cond-v">沪深主板（沪 600/601/603/605，深 000/001/002），剔除 ST</span></li>
       <li><span class="cond-k">股价</span><span class="cond-v">3 元 &lt; 收盘价 &lt; 25 元</span></li>
-      <li><span class="cond-k">涨停</span><span class="cond-v">涨停<b>恰在 2 个交易日前</b>，且非连板</span></li>
+      <li><span class="cond-k">涨停</span><span class="cond-v">涨停<b>恰在 2 个交易日前</b>，且当日是<b>首板</b>（前一日不是涨停）、<b>非一字板</b>（盘中打开过）</span></li>
       <li><span class="cond-k">缺口</span><span class="cond-v">涨停次日跳空、<b>缺口日不是涨停</b>（否则即连板），且到今天为止<b>缺口上方只有 2 根 K 线</b></span></li>
       <li><span class="cond-k">筹码</span><span class="cond-v">当日筹码集中度小于上一日（收敛）</span></li>
     </ul>
@@ -87,7 +87,7 @@
 const $ = id => document.getElementById(id);
 const COND = [
   ['股价', '股价 3~25'],
-  ['涨停', '2日前涨停·非连板'],
+  ['涨停', '首板·非一字板'],
   ['缺口', '次日跳空·缺口日不涨停'],
   ['筹码', '集中度收敛']
 ];

@@ -28,7 +28,7 @@ def d(i):
 def build(flat=140, base=10.0, lu_mult=1.10, cons_lo=0.995, cons_hi=1.005,
           vol_base=4e7, vol_cons=4e7, hold_days=1, gap_extra=1.005,
           prev_limit=False, fill_gap=False, wide_last=False,
-          gap_at_limit_up=False, gap_day_limit_up=False):
+          gap_at_limit_up=False, gap_day_limit_up=False, yizi_t=False):
     """按固定剧本生成 K 线；参数用来故意破坏某一条条件。"""
     bars = []
 
@@ -47,7 +47,11 @@ def build(flat=140, base=10.0, lu_mult=1.10, cons_lo=0.995, cons_hi=1.005,
     t_close = base * (lu_mult * 1.10 if prev_limit else lu_mult)
 
     # ---- 涨停日 T ----
-    if gap_at_limit_up:
+    if yizi_t:
+        # 一字板：开盘即涨停、全天不打开 → open = high = low = close
+        add(t_close, t_close, t_close, t_close, vol_cons * 0.5)
+        gap_top = t_close * gap_extra
+    elif gap_at_limit_up:
         # 缺口放在涨停当日（新规则下应被淘汰）
         add(prev_high * 1.02, t_close, prev_high * gap_extra, t_close, vol_cons * 1.5)
         gap_top = None
@@ -125,8 +129,14 @@ def main():
 
     print("== 3. 涨停条件 ==")
     rr = run_case(build(prev_limit=True))
-    check("连板（前一日也涨停）淘汰", rr is not None and not rr["flags"]["涨停"],
+    check("非首板（前一日也涨停）淘汰", rr is not None and not rr["flags"]["涨停"],
           "" if rr is None else "涨停距今 %s 日" % rr["limit_age"])
+    rr = run_case(build(yizi_t=True))
+    check("一字板（最低价=收盘价）淘汰", rr is not None and not rr["flags"]["涨停"],
+          "" if rr is None else "涨停日实体 %s%%" % rr["limit_body_pct"])
+    rr = run_case(build())
+    check("首板 + 盘中打开过 通过", rr is not None and rr["flags"]["涨停"],
+          "" if rr is None else "涨停日实体 %s%%" % rr["limit_body_pct"])
     rr = run_case(build(hold_days=0))
     check("涨停仅 1 日前（缺口上方 1 根）淘汰", rr is not None and not rr["flags"]["涨停"],
           "" if rr is None else "涨停距今 %s 日" % rr["limit_age"])

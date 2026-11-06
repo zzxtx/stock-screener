@@ -5,8 +5,10 @@
 筛选条件（全部满足才算命中）：
   0. 市场：沪深主板（沪 600/601/603/605，深 000/001/002），剔除 ST / *ST / 退市
   1. 股价：3 元 < 收盘价 < 25 元
-  2. 涨停：涨停日 T 恰好是 2 个交易日前，且为「非连板」（T-1 日不是涨停）
-  3. 缺口：T+1 跳空，且到最新交易日为止，缺口上方（含缺口当根）只有 2 根 K 线
+  2. 涨停：涨停日 T 恰好是 2 个交易日前，且 T 是「首板」（T-1 不是涨停）、
+     「非一字板」（当日盘中打开过，最低价明显低于收盘价）
+  3. 缺口：T+1 跳空（缺口日本身不是涨停），且到最新交易日为止，
+     缺口上方（含缺口当根）只有 2 根 K 线
 
   换句话说：这是给「涨停 → 次日跳空 → 第三日进场」这条节奏定的定时信号。
   涨停日 T、缺口日 T+1、运行当日 T+2（即今天进场），次日 T+3 找机会离场。
@@ -51,10 +53,16 @@ LIMIT_UP_PCT = 0.098      # 主板 10% 口径，按涨幅 >= 9.8% 近似
 #   · 缺口落在倒数第 2 根 K 线
 #   · 涨停日就是它前一根（倒数第 3 根），即涨停恰好 2 个交易日前
 BARS_ABOVE_GAP = 2
-NO_CONSECUTIVE = True     # 非连板：涨停前一日不能再是涨停
-# 缺口日（T+1）本身不能是涨停。
-# 缺口由一根涨停板（尤其一字板）造出来时，图形上就是连板 ——
-# 「涨停板上一日不是涨停板」在这类票上不成立，而且一字板也买不进。
+# 首板：涨停日 T 的前一交易日 T-1 不能再是涨停（这是 T 为「首板」的定义）。
+# 取代原来的「非连板」说法。
+FIRST_BOARD = True
+# 非一字板：T 当日不能开盘即封死、全天不打开。
+# 判定口径 = 当日最低价与收盘价之间至少有 YIZI_TOL_PCT 的落差；
+# 一字板满足 low == close，会被这条剔除。
+NOT_YIZI_BAN = True
+YIZI_TOL_PCT = 0.2        # 最低价比收盘价低不足这个百分比 → 视为一字板
+# 缺口日（T+1）本身不能是涨停 —— 它属于缺口条件，不在「首板」范围内：
+# 缺口若由一根涨停板造出来，图形上就是连板，而且一字板根本买不进。
 GAP_DAY_NOT_LIMIT_UP = True
 GAP_MIN_PCT = 0.2         # 缺口幅度下限 %
 GAP_ALLOW_PARTIAL = False # False=完全未回补；True=允许部分回补
@@ -92,7 +100,7 @@ KLINE_HEADERS = {"User-Agent": UA}
 # 四条信号条件（顺序即漏斗顺序）
 CONDITIONS = [
     ("股价", "3 元 < 股价 < 25 元"),
-    ("涨停", "涨停恰在 2 个交易日前"),
+    ("涨停", "首板·非一字板·2 日前"),
     ("缺口", "次日跳空·缺口日不涨停·上方仅 2 根"),
     ("筹码", "筹码集中度小于上一日"),
 ]
@@ -230,12 +238,25 @@ def is_limit_up(bars, i):
     return (bars[i]["close"] - prev) / prev >= LIMIT_UP_PCT
 
 
+def is_yizi_ban(bars, i):
+    """
+    第 i 根是否一字板：开盘即封死涨停、全天不打开。
+
+    判定口径看「最低价相对收盘价的落差」—— 一字板满足 low == close；
+    T 字板（盘中打开过）low 会明显低于 close，算非一字板。
+    """
+    b = bars[i]
+    if b["close"] <= 0:
+        return False
+    return (b["close"] - b["low"]) / b["close"] * 100.0 < YIZI_TOL_PCT
+
+
 def limit_up_index(bars):
     """
     涨停日被缺口位置钉死：缺口上方只有 BARS_ABOVE_GAP 根 K 线，
     所以缺口在倒数第 BARS_ABOVE_GAP 根，涨停就在它前一根。
 
-    返回涨停日下标；不满足「该位置是涨停」「非连板」时返回 None。
+    返回涨停日下标；不满足「该位置是涨停」「首板」「非一字板」时返回 None。
     """
     n = len(bars)
     gap_i = n - BARS_ABOVE_GAP          # 缺口应出现的下标
@@ -244,8 +265,10 @@ def limit_up_index(bars):
         return None
     if not is_limit_up(bars, t):
         return None
-    if NO_CONSECUTIVE and is_limit_up(bars, t - 1):
-        return None                      # 连板
+    if FIRST_BOARD and is_limit_up(bars, t - 1):
+        return None                      # T-1 也涨停 → 不是首板
+    if NOT_YIZI_BAN and is_yizi_ban(bars, t):
+        return None                      # 一字板
     return t
 
 
@@ -505,6 +528,8 @@ def evaluate(c, as_of, stats, lock):
         "nmc_yi": c["nmc_yi"],
         "limit_date": bars[t]["day"] if t is not None else "",
         "limit_age": (n - 1 - t) if t is not None else "",
+        "limit_body_pct": (round((bars[t]["close"] - bars[t]["low"]) / bars[t]["close"] * 100.0, 2)
+                           if t is not None and bars[t]["close"] > 0 else ""),
         "gap_date": gap["gap_date"] if gap else "",
         "gap_pct": gap["gap_pct"] if gap else "",
         "gap_day_chg": gap["gap_day_chg"] if gap else "",
@@ -527,6 +552,7 @@ CSV_FIELDS = [
     ("code", "代码"), ("name", "名称"), ("base_date", "基准日期"),
     ("close", "收盘价"), ("chg_pct", "当日涨幅%"), ("nmc_yi", "流通市值(亿)"),
     ("limit_date", "涨停日"), ("limit_age", "涨停距今(日)"),
+    ("limit_body_pct", "涨停日实体%(低/收)"),
     ("gap_date", "缺口日"), ("gap_pct", "缺口幅度%"),
     ("gap_day_chg", "缺口日涨幅%"), ("gap_age", "缺口距今(日)"),
     ("bars_above", "缺口上方K线数"), ("gap_range", "缺口区间"),
