@@ -28,7 +28,7 @@ def d(i):
 def build(flat=140, base=10.0, lu_mult=1.10, cons_lo=0.995, cons_hi=1.005,
           vol_base=4e7, vol_cons=4e7, hold_days=1, gap_extra=1.005,
           prev_limit=False, fill_gap=False, wide_last=False,
-          gap_at_limit_up=False):
+          gap_at_limit_up=False, gap_day_limit_up=False):
     """按固定剧本生成 K 线；参数用来故意破坏某一条条件。"""
     bars = []
 
@@ -60,6 +60,11 @@ def build(flat=140, base=10.0, lu_mult=1.10, cons_lo=0.995, cons_hi=1.005,
     if gap_top is None:
         g_close = t_close * 1.01
         add(t_close, g_close * 1.01, t_close * 0.999, g_close, vol_cons)
+    elif gap_day_limit_up:
+        # 缺口日自己也是涨停（一字板）：开盘=最低=最高=收盘=涨停价
+        g_close = t_close * 1.10
+        gap_top = g_close
+        add(g_close, g_close, g_close, g_close, vol_cons * 0.6)
     else:
         g_close = t_close * 1.03
         add(t_close * 1.01, g_close * 1.02, gap_top, g_close, vol_cons * 1.2)
@@ -141,6 +146,9 @@ def main():
     check("缺口在涨停次日 通过", rr is not None and rr["flags"]["缺口"],
           "" if rr is None else "缺口 %s +%.2f%%，上方 %s 根"
           % (rr["gap_date"], rr["gap_pct"], rr["bars_above"]))
+    rr = run_case(build(gap_day_limit_up=True))
+    check("缺口日也是涨停（一字板）淘汰", rr is not None and not rr["flags"]["缺口"],
+          "（缺口日的上一日必然是涨停，属连板）")
     rr = run_case(build(fill_gap=True))
     check("缺口已回补 淘汰", rr is not None and not rr["flags"]["缺口"], "")
     rr = run_case(build(gap_extra=1.001))

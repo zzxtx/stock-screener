@@ -31,6 +31,8 @@ object StockScreen {
     /** 缺口上方（含缺口当根）的 K 线根数：2 表示缺口在倒数第 2 根，涨停在其前一根 */
     const val BARS_ABOVE_GAP = 2
     const val NO_CONSECUTIVE = true
+    /** 缺口日（T+1）本身不能是涨停：否则那根涨停板的上一日必然也是涨停，属连板 */
+    const val GAP_DAY_NOT_LIMIT_UP = true
     const val GAP_MIN_PCT = 0.2
     const val GAP_ALLOW_PARTIAL = false
     const val CYQ_WINDOW = 90
@@ -59,8 +61,8 @@ object StockScreen {
         val code: String, val name: String, val baseDate: String,
         val close: Double, val chgPct: Double, val nmcYi: Double,
         val limitDate: String, val limitAge: Int,
-        val gapDate: String, val gapPct: Double, val gapAge: Int,
-        val barsAbove: Int, val gapRange: String,
+        val gapDate: String, val gapPct: Double, val gapDayChg: Double,
+        val gapAge: Int, val barsAbove: Int, val gapRange: String,
         val scrToday: Double, val scrPrev: Double, val scrDelta: Double,
         val scrP5: Double, val scrP95: Double,
         val score: Int, val missing: String
@@ -70,7 +72,8 @@ object StockScreen {
                            val low: Double, val close: Double, val volume: Double)
 
     private data class Gap(val index: Int, val date: String, val pct: Double,
-                           val age: Int, val barsAbove: Int, val range: String)
+                           val dayChg: Double, val age: Int, val barsAbove: Int,
+                           val range: String)
 
     interface Listener {
         fun onState(state: String)
@@ -198,6 +201,7 @@ object StockScreen {
             limitDate = if (t >= 0) bars[t].day else "",
             limitAge = if (t >= 0) n - 1 - t else 0,
             gapDate = gap?.date ?: "", gapPct = gap?.pct ?: 0.0,
+            gapDayChg = gap?.dayChg ?: 0.0,
             gapAge = gap?.age ?: 0, barsAbove = gap?.barsAbove ?: 0,
             gapRange = gap?.range ?: "",
             scrToday = if (scrToday.isNaN()) 0.0 else round2(scrToday),
@@ -239,6 +243,7 @@ object StockScreen {
         val n = bars.size
         val i = t + 1
         if (i < 1 || i >= n) return null
+        if (GAP_DAY_NOT_LIMIT_UP && isLimitUp(bars, i)) return null
         val prevHigh = bars[i - 1].high
         val low = bars[i].low
         if (prevHigh <= 0 || low <= prevHigh) return null
@@ -250,7 +255,9 @@ object StockScreen {
             val limit = if (GAP_ALLOW_PARTIAL) prevHigh else low
             if (lowestAfter <= limit) return null
         }
-        return Gap(i, bars[i].day, round2(pct), n - 1 - i, n - i,
+        val pc = bars[i - 1].close
+        val dayChg = if (pc > 0) (bars[i].close - pc) / pc * 100.0 else 0.0
+        return Gap(i, bars[i].day, round2(pct), round2(dayChg), n - 1 - i, n - i,
             String.format(java.util.Locale.US, "%.2f ~ %.2f", prevHigh, low))
     }
 

@@ -52,6 +52,10 @@ LIMIT_UP_PCT = 0.098      # 主板 10% 口径，按涨幅 >= 9.8% 近似
 #   · 涨停日就是它前一根（倒数第 3 根），即涨停恰好 2 个交易日前
 BARS_ABOVE_GAP = 2
 NO_CONSECUTIVE = True     # 非连板：涨停前一日不能再是涨停
+# 缺口日（T+1）本身不能是涨停。
+# 缺口由一根涨停板（尤其一字板）造出来时，图形上就是连板 ——
+# 「涨停板上一日不是涨停板」在这类票上不成立，而且一字板也买不进。
+GAP_DAY_NOT_LIMIT_UP = True
 GAP_MIN_PCT = 0.2         # 缺口幅度下限 %
 GAP_ALLOW_PARTIAL = False # False=完全未回补；True=允许部分回补
 
@@ -89,7 +93,7 @@ KLINE_HEADERS = {"User-Agent": UA}
 CONDITIONS = [
     ("股价", "3 元 < 股价 < 25 元"),
     ("涨停", "涨停恰在 2 个交易日前"),
-    ("缺口", "缺口上方仅 2 根 K 线"),
+    ("缺口", "次日跳空·缺口日不涨停·上方仅 2 根"),
     ("筹码", "筹码集中度小于上一日"),
 ]
 COND_NAMES = [c[0] for c in CONDITIONS]
@@ -254,10 +258,15 @@ def find_gap_after_limit_up(bars, t):
 
     向上跳空缺口：当日最低价 > 前一日最高价，缺口区间 = [前一日最高, 当日最低]。
     未回补：缺口之后所有 K 线的最低价都没进入该区间。
+
+    另外要求缺口日本身不是涨停 —— 否则那根涨停板的上一日（即 T）必然是涨停，
+    图形上就是连板；一字板也根本买不进。
     """
     n = len(bars)
     i = t + 1
     if i < 1 or i >= n:
+        return None
+    if GAP_DAY_NOT_LIMIT_UP and is_limit_up(bars, i):
         return None
     prev_high = bars[i - 1]["high"]
     low = bars[i]["low"]
@@ -272,10 +281,13 @@ def find_gap_after_limit_up(bars, t):
         limit = prev_high if GAP_ALLOW_PARTIAL else low
         if lowest_after <= limit:
             return None
+    prev_close = bars[i - 1]["close"]
+    day_chg = ((bars[i]["close"] - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
     return {
         "gap_index": i,
         "gap_date": bars[i]["day"],
         "gap_pct": round(gap_pct, 2),
+        "gap_day_chg": round(day_chg, 2),
         "gap_age": n - 1 - i,
         "bars_above": n - i,
         "gap_range": "%.2f ~ %.2f" % (prev_high, low),
@@ -495,6 +507,7 @@ def evaluate(c, as_of, stats, lock):
         "limit_age": (n - 1 - t) if t is not None else "",
         "gap_date": gap["gap_date"] if gap else "",
         "gap_pct": gap["gap_pct"] if gap else "",
+        "gap_day_chg": gap["gap_day_chg"] if gap else "",
         "gap_age": gap["gap_age"] if gap else "",
         "bars_above": gap["bars_above"] if gap else "",
         "gap_range": gap["gap_range"] if gap else "",
@@ -514,8 +527,9 @@ CSV_FIELDS = [
     ("code", "代码"), ("name", "名称"), ("base_date", "基准日期"),
     ("close", "收盘价"), ("chg_pct", "当日涨幅%"), ("nmc_yi", "流通市值(亿)"),
     ("limit_date", "涨停日"), ("limit_age", "涨停距今(日)"),
-    ("gap_date", "缺口日"), ("gap_pct", "缺口幅度%"), ("gap_age", "缺口距今(日)"),
-    ("gap_range", "缺口区间"),
+    ("gap_date", "缺口日"), ("gap_pct", "缺口幅度%"),
+    ("gap_day_chg", "缺口日涨幅%"), ("gap_age", "缺口距今(日)"),
+    ("bars_above", "缺口上方K线数"), ("gap_range", "缺口区间"),
     ("scr_today", "今日集中度"), ("scr_prev", "昨日集中度"),
     ("scr_delta", "集中度变化"), ("scr_p5", "成本P5"), ("scr_p95", "成本P95"),
 ]
