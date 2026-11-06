@@ -100,7 +100,7 @@ function initDate() {
 
 function stockCard(r) {
   let tags = '';
-  if (r.limitDate) tags += '<span class="tag limit">涨停 ' + r.limitDate + ' · ' + r.limitAge + '日前</span>';
+  if (r.limitDate) tags += '<span class="tag limit">涨停 ' + r.limitDate + ' · ' + r.limitAge + '日前 · 实体 ' + r.limitBodyPct.toFixed(2) + '%</span>';
   if (r.gapDate) tags += '<span class="tag gap">缺口 ' + r.gapDate + ' +' + r.gapPct.toFixed(2) + '%，当日 ' + r.gapDayChg.toFixed(2) + '%，上方 ' + r.barsAbove + ' 根</span>';
   tags += '<span class="tag scr">集中度 ' + r.scrPrev.toFixed(2) + ' → ' + r.scrToday.toFixed(2) + '</span>';
   tags += '<span class="tag">流通 ' + r.nmcYi.toFixed(0) + '亿</span>';
